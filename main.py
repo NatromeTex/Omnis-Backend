@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import hmac
+import json
 import os
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc
@@ -25,6 +27,47 @@ app.add_middleware(
 )
 
 ph = PasswordHasher()
+
+# ── WebSocket connection manager ──────────────────────────────────────
+
+class ConnectionManager:
+    """Tracks active WebSocket connections per chat."""
+
+    def __init__(self):
+        # chat_id -> dict[user_id, WebSocket]
+        self.active: dict[int, dict[int, WebSocket]] = {}
+
+    async def connect(self, chat_id: int, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.active.setdefault(chat_id, {})[user_id] = ws
+
+    def disconnect(self, chat_id: int, user_id: int):
+        chat_conns = self.active.get(chat_id)
+        if chat_conns:
+            chat_conns.pop(user_id, None)
+            if not chat_conns:
+                del self.active[chat_id]
+
+    async def broadcast(self, chat_id: int, payload: dict, exclude_user_id: int | None = None):
+        """Send a JSON message to every user connected to *chat_id*."""
+        chat_conns = self.active.get(chat_id)
+        if not chat_conns:
+            return
+        data = json.dumps(payload)
+        stale: list[int] = []
+        for uid, ws in chat_conns.items():
+            if uid == exclude_user_id:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                stale.append(uid)
+        for uid in stale:
+            chat_conns.pop(uid, None)
+
+manager = ConnectionManager()
+
+# ── Startup ───────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
@@ -223,6 +266,11 @@ async def list_sessions(
     device_id: str = Header(..., alias="X-Device-ID"),
 ):
     token = authorization.removeprefix("Bearer ").strip()
+    current_token_hash = hmac.new(
+        SERVER_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
     sessions = (
         db.query(SessionModel)
@@ -239,7 +287,7 @@ async def list_sessions(
             "created_at": s.created_at,
             "expires_at": s.expires_at,
             "current": (
-                s.session_token == token and
+                s.session_token_hash == current_token_hash and
                 s.device_id == device_id
             ),
         }
@@ -277,13 +325,18 @@ async def revoke_other(
     db: Session = Depends(get_db),
 ):
     token = authorization.removeprefix("Bearer ").strip()
+    current_token_hash = hmac.new(
+        SERVER_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
     (
         db.query(SessionModel)
         .filter(
             SessionModel.user_id == user.id,
             ~(
-                (SessionModel.session_token == token) &
+                (SessionModel.session_token_hash == current_token_hash) &
                 (SessionModel.device_id == device_id)
             )
         )
@@ -355,6 +408,113 @@ async def get_public_key(
         "username": user.username,
         "identity_pub": user_key.identity_pub,
     }
+
+# ── WebSocket helper: authenticate from query params ─────────────────
+
+def ws_authenticate(token: str, device_id: str, db: Session) -> User | None:
+    """Validate a session token + device-id and return the User, or None."""
+    token_hash = hmac.new(
+        SERVER_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    session = (
+        db.query(SessionModel)
+        .filter(
+            SessionModel.session_token_hash == token_hash,
+            SessionModel.expires_at > datetime.now(timezone.utc),
+            SessionModel.device_id == device_id,
+        )
+        .one_or_none()
+    )
+    if not session:
+        return None
+
+    return db.query(User).filter(User.id == session.user_id).one_or_none()
+
+
+# ── WebSocket endpoint ───────────────────────────────────────────────
+
+@app.websocket("/chat/ws/{chat_id}")
+async def chat_ws(
+    websocket: WebSocket,
+    chat_id: int,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    db: Session = SessionLocal()
+    try:
+        # authenticate
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        # verify membership
+        chat = (
+            db.query(Chat)
+            .filter(
+                Chat.id == chat_id,
+                or_(
+                    Chat.user_a_id == user.id,
+                    Chat.user_b_id == user.id,
+                ),
+            )
+            .one_or_none()
+        )
+        if not chat:
+            await websocket.close(code=4004, reason="Chat not found")
+            return
+
+        await manager.connect(chat_id, user.id, websocket)
+
+        # send initial history (last 50 messages)
+        messages = (
+            db.query(Message)
+            .filter(Message.chat_id == chat_id)
+            .order_by(desc(Message.id))
+            .limit(50)
+            .all()
+        )
+        messages.reverse()
+
+        history_payload = [
+            {
+                "id": m.id,
+                "sender_id": m.sender_id,
+                "epoch_id": m.epoch_id,
+                "reply_id": m.reply_id,
+                "ciphertext": m.ciphertext,
+                "nonce": m.nonce,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in messages
+        ]
+        next_cursor = messages[0].id if messages else None
+
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "messages": history_payload,
+            "next_cursor": next_cursor,
+        }))
+
+        # keep connection alive – listen for client pings / close
+        while True:
+            try:
+                data = await websocket.receive_text()
+                # clients may send {"type":"ping"} to keep alive
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        manager.disconnect(chat_id, user.id)
+        db.close()
+
 
 # Chat endpoints
 @app.get("/chat/list")
@@ -435,6 +595,7 @@ async def fetch_chat(
             "id": m.id,
             "sender_id": m.sender_id,
             "epoch_id": m.epoch_id,
+            "reply_id": m.reply_id,
             "ciphertext": m.ciphertext,
             "nonce": m.nonce,
             "created_at": m.created_at,
@@ -562,10 +723,12 @@ async def create_epoch(
         raise HTTPException(status_code=404, detail="Chat not found")
 
     # rate-limit: at most one epoch every 5 seconds per chat
+    # (ignore placeholder epochs with empty keys)
     recent = (
         db.query(ChatEpoch)
         .filter(
             ChatEpoch.chat_id == chat_id,
+            ChatEpoch.wrapped_key_a != "",
             ChatEpoch.created_at
             > datetime.now(timezone.utc) - timedelta(seconds=5),
         )
@@ -672,6 +835,7 @@ async def message(
         chat_id=chat.id,
         sender_id=user.id,
         epoch_id=payload.epoch_id,
+        reply_id=payload.reply_id,
         ciphertext=payload.ciphertext,
         nonce=payload.nonce,
     )
@@ -679,6 +843,21 @@ async def message(
     db.add(msg)
     db.commit()
     db.refresh(msg)
+
+    # broadcast to WebSocket subscribers of this chat
+    ws_payload = {
+        "type": "new_message",
+        "message": {
+            "id": msg.id,
+            "sender_id": msg.sender_id,
+            "epoch_id": msg.epoch_id,
+            "reply_id": msg.reply_id,
+            "ciphertext": msg.ciphertext,
+            "nonce": msg.nonce,
+            "created_at": msg.created_at.isoformat(),
+        },
+    }
+    asyncio.ensure_future(manager.broadcast(chat_id, ws_payload))
 
     return {
         "id": msg.id,

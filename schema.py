@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from typing import Optional
 
 class SignupRequest(BaseModel):
     username: str
@@ -24,6 +25,7 @@ class MessageRequest(BaseModel):
     epoch_id: int
     ciphertext: str
     nonce: str
+    reply_id: Optional[int] = None
 
 class LogoutRequest(BaseModel):
     session_id: int

@@ -4,6 +4,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Index,
     DateTime,
     ForeignKey,
     UniqueConstraint,
@@ -124,12 +125,22 @@ class Message(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
+    reply_id = Column(
+        Integer, 
+        ForeignKey("messages.id", ondelete="SET NULL"), 
+        nullable=True,
+    )
 
     epoch_id = Column(Integer, ForeignKey("chat_epochs.id"))
     ciphertext = Column(Text, nullable=False)
     nonce = Column(String(48), nullable=False)
     
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index("ix_messages_chat_created", "chat_id", "created_at"),
+        Index("ix_messages_reply_id", "reply_id"),
+    )
 
 def init_db():
     Base.metadata.create_all(bind=engine)

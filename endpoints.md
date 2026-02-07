@@ -397,9 +397,105 @@ Errors:
 
 ---
 
+### WebSocket /chat/ws/{chat_id}
+
+Opens a persistent WebSocket connection for real-time message delivery in a
+chat. Replaces polling of `GET /chat/fetch/{chat_id}` for the active chat
+window.
+
+**Connection URL**
+```
+ws://<host>:8000/chat/ws/{chat_id}?token=<session_token>&device_id=<uuid-v4>
+```
+
+**Path parameters**
+- `chat_id` — integer
+
+**Query parameters** (used for authentication)
+```
+token: string (required)   # the session token from POST /auth/login
+device_id: string (required)  # UUID v4 device identifier
+```
+
+**Connection lifecycle**
+
+1. The server authenticates the token + device_id pair.
+   - On failure the connection is closed with code `4001` ("Unauthorized").
+   - If the user is not a member of the chat, closed with `4004` ("Chat not found").
+2. Immediately after connecting, the server sends a `history` frame containing
+   the last 50 messages (same shape as the old REST response).
+3. Whenever a new message is sent via `POST /chat/{chat_id}/message`, the
+   server pushes a `new_message` frame to every connected member.
+4. The client may send `{"type":"ping"}` at any time; the server replies with
+   `{"type":"pong"}`.
+5. Either side may close the connection normally.
+
+**Server → Client frames**
+
+*history* (sent once on connect)
+```json
+{
+  "type": "history",
+  "messages": [
+    {
+      "id": 1001,
+      "sender_id": 1,
+      "epoch_id": 5,
+      "reply_id": 1000,
+      "ciphertext": "base64-or-opaque-string",
+      "nonce": "string",
+      "created_at": "ISO-8601"
+    }
+  ],
+  "next_cursor": 1001
+}
+```
+
+*new_message* (pushed on each new message)
+```json
+{
+  "type": "new_message",
+  "message": {
+    "id": 1002,
+    "sender_id": 2,
+    "epoch_id": 5,
+    "reply_id": null,
+    "ciphertext": "base64-or-opaque-string",
+    "nonce": "string",
+    "created_at": "ISO-8601"
+  }
+}
+```
+
+*pong*
+```json
+{
+  "type": "pong"
+}
+```
+
+**Client → Server frames**
+
+*ping*
+```json
+{
+  "type": "ping"
+}
+```
+
+**Close codes**
+| Code | Meaning |
+|------|---------|
+| 4001 | Unauthorized (bad token / device_id) |
+| 4004 | Chat not found or user is not a member |
+
+---
+
 ### GET /chat/fetch/{chat_id}
 
 Fetches messages for a chat, in chronological order (oldest to newest).
+Primarily used for **scrollback / pagination**; for real-time delivery prefer
+the `WebSocket /chat/ws/{chat_id}` endpoint above.
 
 **Headers**
 ```
@@ -424,6 +520,7 @@ limit: integer (optional, default 50, max 100)
       "id": 1001,
       "sender_id": 1,
       "epoch_id": 5,
+      "reply_id": 1000,
       "ciphertext": "base64-or-opaque-string",
       "nonce": "string",
       "created_at": "ISO-8601"
@@ -533,7 +630,8 @@ X-Device-ID: <uuid-v4>
 {
   "epoch_id": 5,
   "ciphertext": "base64-or-opaque-string",
-  "nonce": "string"
+  "nonce": "string",
+  "reply_id": 1000
 }
 ```
 
