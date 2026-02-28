@@ -218,14 +218,30 @@ async def login(
 
 @app.post("/auth/logout")
 async def logout(
+    authorization: str = Header(...),
+    device_Id: str = Header(..., alias="X-Device-ID"),
     user: User = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
+    token = authorization.removeprefix("Bearer ").strip()
+    token_hash = hmac.new(
+        SERVER_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
     session = (
         db.query(SessionModel)
-        .filter(SessionModel.user_id == user.id)
+        .filter(
+            SessionModel.session_token_hash == token_hash,
+            SessionModel.user_id == user.id,
+            SessionModel.device_id == device_Id,
+        )
         .one_or_none()
     )
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
 
     db.delete(session)
     db.commit()
