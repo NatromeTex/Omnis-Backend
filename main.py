@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, desc
+from sqlalchemy import func, or_, desc, case
 from argon2 import PasswordHasher
 from models import Session as SessionModel
 from argon2.exceptions import VerifyMismatchError
@@ -311,7 +311,7 @@ async def search_users(
         )
         .order_by(
             # exact match first, then starts-with, then the rest
-            func.case(
+            case(
                 (func.lower(User.username) == q.lower(), 0),
                 (func.lower(User.username).like(f"{q.lower()}%"), 1),
                 else_=2,
