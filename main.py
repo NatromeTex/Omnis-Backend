@@ -5,6 +5,7 @@ import json
 import os
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc
 from argon2 import PasswordHasher
@@ -17,6 +18,8 @@ import secrets
 from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch
 
 app = FastAPI()
+
+app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
 app.add_middleware(
     CORSMiddleware,

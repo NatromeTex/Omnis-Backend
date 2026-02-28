@@ -1,6 +1,6 @@
-// Use the same host as the frontend, but on port 8000
-const API_BASE = `http://${window.location.hostname}:8000`;
-const WS_BASE  = `ws://${window.location.hostname}:8000`;
+// Use the same host (and port) as the frontend
+const API_BASE = `${window.location.protocol}//${window.location.host}`;
+const WS_BASE  = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
 
 // Debug: Log API base URL (check browser console on phone)
 console.log('API_BASE:', API_BASE);
@@ -726,6 +726,7 @@ function renderChatList(chats) {
     chats.forEach(chat => {
         const item = document.createElement('div');
         item.className = 'chat-item' + (chat.chat_id === currentChatId ? ' active' : '');
+        item.dataset.chatId = chat.chat_id;
         item.innerHTML = `<span class="username">${escapeHtml(chat.with_user)}</span>`;
         item.addEventListener('click', () => openChat(chat.chat_id, chat.with_user));
         chatList.appendChild(item);
@@ -882,11 +883,10 @@ async function openChat(chatId, username) {
     chatView.classList.remove('hidden');
     chatWithUser.textContent = username;
     
-    // Update active state in list
+    // Update active state in list using data-chat-id
     document.querySelectorAll('.chat-item').forEach(item => {
-        item.classList.remove('active');
+        item.classList.toggle('active', parseInt(item.dataset.chatId) === chatId);
     });
-    event?.target?.closest('.chat-item')?.classList.add('active');
 
     // Pre-fetch peer's public key
     try {
@@ -963,6 +963,8 @@ function renderMessages(messages) {
         const isSent = msg.sender_id === currentUserId;
         const div = document.createElement('div');
         div.className = `message ${isSent ? 'sent' : 'received'}`;
+        div.dataset.msgId = msg.id;
+        div.dataset.senderId = msg.sender_id;
         
         const time = parseUTCDate(msg.created_at).toLocaleTimeString([], { 
             hour: '2-digit', 
@@ -1039,7 +1041,11 @@ async function sendMessage() {
             })
         });
         clearReplyTarget();
-        // No need to loadMessages() — the server broadcasts via WebSocket
+        // If WebSocket is not open (e.g. connection dropped), fall back to HTTP fetch
+        if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
+            await loadMessages();
+        }
+        // Otherwise the server broadcasts the new message via WebSocket
     } catch (error) {
         console.error('Send message error:', error);
         
@@ -1127,8 +1133,8 @@ function connectChatWebSocket(chatId) {
     chatSocket.addEventListener('close', (evt) => {
         console.log(`WS closed (code=${evt.code})`);
         chatSocket = null;
-        // Reconnect unless we intentionally closed or auth failed
-        if (evt.code !== 4001 && currentChatId === chatId && authToken) {
+        // Reconnect unless we intentionally closed, auth failed (4001), or chat not found (4004)
+        if (evt.code !== 4001 && evt.code !== 4004 && currentChatId === chatId && authToken) {
             wsReconnectTimer = setTimeout(() => connectChatWebSocket(chatId), 3000);
         }
     });
@@ -1247,6 +1253,8 @@ function appendMessage(msg) {
     const isSent = msg.sender_id === currentUserId;
     const div = document.createElement('div');
     div.className = `message ${isSent ? 'sent' : 'received'}`;
+    div.dataset.msgId = msg.id;
+    div.dataset.senderId = msg.sender_id;
 
     const time = parseUTCDate(msg.created_at).toLocaleTimeString([], {
         hour: '2-digit',
@@ -1255,12 +1263,21 @@ function appendMessage(msg) {
 
     let replyHtml = '';
     if (msg.reply_id) {
-        // Try to find the reply target already rendered
-        const existingMsgs = messagesContainer.querySelectorAll('.message');
-        // We don't have a handy map here so show minimal info
+        // Try to find the reply target from already-rendered messages
+        const allRendered = messagesContainer.querySelectorAll('.message');
+        let replySender = 'Reply';
+        let replyText = '';
+        for (const el of allRendered) {
+            if (parseInt(el.dataset.msgId) === msg.reply_id) {
+                replySender = el.dataset.senderId == currentUserId ? 'You' : (currentChatPeer || 'User');
+                replyText = el.querySelector('.text')?.textContent || '';
+                break;
+            }
+        }
         replyHtml = `
             <div class="reply-snippet">
-                <div class="reply-snippet-label">Reply</div>
+                <div class="reply-snippet-label">${escapeHtml(replySender)}</div>
+                ${replyText ? `<div class="reply-snippet-text">${escapeHtml(getReplyPreviewText(replyText, 140))}</div>` : ''}
             </div>
         `;
     }
