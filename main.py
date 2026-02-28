@@ -294,6 +294,34 @@ async def list_sessions(
         for s in sessions
     ]
 
+@app.get("/users/search")
+async def search_users(
+    q: str = Query(..., min_length=1),
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    matches = (
+        db.query(User)
+        .filter(
+            User.username.ilike(f"%{q}%"),
+            User.id != user.id,
+        )
+        .order_by(
+            # exact match first, then starts-with, then the rest
+            func.case(
+                (func.lower(User.username) == q.lower(), 0),
+                (func.lower(User.username).like(f"{q.lower()}%"), 1),
+                else_=2,
+            ),
+            func.length(User.username),
+        )
+        .limit(7)
+        .all()
+    )
+
+    return [{"id": u.id, "username": u.username} for u in matches]
+
+
 @app.delete("/users/sessions/revoke/{session_id}")
 async def revoke_session(
     session_id: int,

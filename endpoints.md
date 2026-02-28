@@ -228,6 +228,45 @@ Errors:
 
 ---
 
+### GET /users/search
+
+Searches for users by partial username match. Returns up to 7 best matches,
+ordered by relevance (exact match first, then prefix matches, then substring
+matches, with shorter usernames ranked higher).
+
+The authenticated user is excluded from results.
+
+**Headers**
+```
+Authorization: Bearer <token>
+X-Device-ID: <uuid-v4>
+```
+
+**Query parameters**
+```
+q: string (required, min length 1)  # partial username to search for
+```
+
+**Response — 200 OK**
+```json
+[
+  {
+    "id": 2,
+    "username": "alice"
+  },
+  {
+    "id": 7,
+    "username": "alicia"
+  }
+]
+```
+
+Errors:
+- `401` — unauthorized
+- `422` — missing or invalid query parameter
+
+---
+
 ### DELETE /users/sessions/revoke/{session_id}
 
 Revokes a specific session belonging to the authenticated user.

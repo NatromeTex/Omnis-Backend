@@ -114,6 +114,7 @@ CREATE INDEX idx_chats_user_b ON chats(user_b_id);
 - `/auth/signup` → `users`
 - `/auth/login` → `sessions`
 - `/auth/logout` → delete from `sessions`
+- `/users/search` → query `users` (partial username match)
 - `/chats` → query `chats`
 - `/chats/{chat_id}` → query `messages`
 - `/chats/{chat_id}/messages` → insert into `messages`

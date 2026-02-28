@@ -112,7 +112,16 @@ The server **never sees plaintext messages or identity private keys**. It only s
 5. Frontend **decrypts the identity private key** using the password and stored salt/nonce.
 6. If decryption fails, the login is not considered complete and a relevant error is displayed.
 
-### 3.3 Chat & Epoch Handling
+### 3.3 User Search & Chat Creation
+
+- To start a new chat, the frontend should use `GET /users/search?q=<partial>` to
+  find users by partial username match.
+- The endpoint returns up to 7 results ranked by relevance (exact → prefix →
+  substring, shorter names first). The current user is excluded.
+- The user selects a result and the frontend calls `POST /chat/create` with the
+  chosen username.
+
+### 3.4 Chat & Epoch Handling
 
 - When a chat is opened or messages are fetched (`/chat/fetch/{chat_id}`), the frontend:
   - Receives `messages[]` containing message data with `epoch_id` references.
