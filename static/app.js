@@ -297,6 +297,30 @@ const Crypto = {
         const plaintextBuffer = await this.decryptAESGCM(epochKey, ciphertext, nonce);
         const decoder = new TextDecoder();
         return decoder.decode(plaintextBuffer);
+    },
+
+    // Encrypt a file/blob with epoch key (for media)
+    async encryptFile(arrayBuffer, epochKey) {
+        const nonce = this.randomBytes(12);
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: nonce },
+            epochKey,
+            arrayBuffer
+        );
+        return {
+            encrypted: new Uint8Array(ciphertext),
+            nonce: this.arrayBufferToBase64(nonce)
+        };
+    },
+
+    // Decrypt a file/blob with epoch key (for media)
+    async decryptFile(encryptedBuffer, nonceBase64, epochKey) {
+        const nonce = new Uint8Array(this.base64ToArrayBuffer(nonceBase64));
+        return crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: nonce },
+            epochKey,
+            encryptedBuffer
+        );
     }
 };
 
@@ -384,6 +408,8 @@ let currentChatPeer = null; // username of peer in current chat
 let chatSocket = null;       // active WebSocket for current chat
 let wsReconnectTimer = null; // reconnect timer handle
 let currentReplyMessage = null;
+let pendingAttachments = []; // files queued for the next message
+let searchDebounceTimer = null;
 
 // ==================== DOM ELEMENTS ====================
 
@@ -407,6 +433,10 @@ const newChatUsername = document.getElementById('new-chat-username');
 const newChatBtn = document.getElementById('new-chat-btn');
 const logoutBtn = document.getElementById('logout-btn');
 const tabBtns = document.querySelectorAll('.tab-btn');
+const fileInput = document.getElementById('file-input');
+const attachBtn = document.getElementById('attach-btn');
+const attachmentPreview = document.getElementById('attachment-preview');
+const searchResults = document.getElementById('search-results');
 
 // ==================== INITIALIZATION ====================
 
@@ -472,11 +502,26 @@ function setupEventListeners() {
         if (e.key === 'Enter') createNewChat();
     });
 
+    // User search
+    newChatUsername.addEventListener('input', handleUserSearchInput);
+    newChatUsername.addEventListener('focus', () => {
+        if (newChatUsername.value.trim().length > 0) handleUserSearchInput();
+    });
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.search-wrapper')) {
+            searchResults.classList.add('hidden');
+        }
+    });
+
     // Send message
     messageForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         await sendMessage();
     });
+
+    // File attachment
+    attachBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', handleFileSelect);
 
     // Reply cancel
     replyCancelBtn.addEventListener('click', () => {
@@ -666,6 +711,7 @@ function clearChatUi() {
     chatWithUser.textContent = 'Chat';
     messageInput.value = '';
     clearReplyTarget();
+    clearAttachments();
     chatView.classList.add('hidden');
     chatPlaceholder.classList.remove('hidden');
 }
@@ -744,11 +790,60 @@ async function createNewChat() {
         });
 
         newChatUsername.value = '';
+        searchResults.classList.add('hidden');
         await loadChats();
         openChat(data.chat_id, username);
     } catch (error) {
         alert(error.message);
     }
+}
+
+// ==================== USER SEARCH ====================
+
+function handleUserSearchInput() {
+    const query = newChatUsername.value.trim();
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+
+    if (query.length === 0) {
+        searchResults.classList.add('hidden');
+        return;
+    }
+
+    searchDebounceTimer = setTimeout(() => performUserSearch(query), 250);
+}
+
+async function performUserSearch(query) {
+    try {
+        const results = await apiCall(`/users/search?q=${encodeURIComponent(query)}`);
+        renderSearchResults(results);
+    } catch (error) {
+        console.error('User search failed:', error);
+        searchResults.classList.add('hidden');
+    }
+}
+
+function renderSearchResults(results) {
+    searchResults.innerHTML = '';
+
+    if (results.length === 0) {
+        searchResults.innerHTML = '<div class="search-no-results">No users found</div>';
+        searchResults.classList.remove('hidden');
+        return;
+    }
+
+    results.forEach(user => {
+        const item = document.createElement('div');
+        item.className = 'search-result-item';
+        item.textContent = user.username;
+        item.addEventListener('click', () => {
+            newChatUsername.value = user.username;
+            searchResults.classList.add('hidden');
+            createNewChat();
+        });
+        searchResults.appendChild(item);
+    });
+
+    searchResults.classList.remove('hidden');
 }
 
 // Fetch peer's public key (cached)
@@ -962,7 +1057,8 @@ function renderMessages(messages) {
     messages.forEach(msg => {
         const isSent = msg.sender_id === currentUserId;
         const div = document.createElement('div');
-        div.className = `message ${isSent ? 'sent' : 'received'}`;
+        const hasAttachments = msg.attachments && msg.attachments.length > 0;
+        div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}`;
         div.dataset.msgId = msg.id;
         div.dataset.senderId = msg.sender_id;
         
@@ -990,6 +1086,18 @@ function renderMessages(messages) {
             <div class="time">${time}</div>
         `;
 
+        // Render attachments
+        if (hasAttachments) {
+            const attachContainer = document.createElement('div');
+            attachContainer.className = 'message-attachments';
+            msg.attachments.forEach(att => {
+                renderAttachmentInMessage(attachContainer, att, msg.epoch_id);
+            });
+            // insert before the .time element
+            const timeEl = div.querySelector('.time');
+            div.insertBefore(attachContainer, timeEl);
+        }
+
         const actions = document.createElement('div');
         actions.className = 'message-actions';
 
@@ -1015,10 +1123,17 @@ function renderMessages(messages) {
 
 async function sendMessage() {
     const body = messageInput.value.trim();
-    if (!body || !currentChatId || !currentChatPeer) return;
+    const hasAttachments = pendingAttachments.length > 0;
+    if ((!body && !hasAttachments) || !currentChatId || !currentChatPeer) return;
+
+    // Capture current attachments and clear UI immediately
+    const filesToUpload = [...pendingAttachments];
+    const messageBody = body || (hasAttachments ? '📎' : '');
+    let mediaIds = [];
 
     try {
         messageInput.value = '';
+        clearAttachments();
         
         // Get or create an epoch for this chat
         let epoch = KeyStore.getLatestEpoch(currentChatId);
@@ -1027,23 +1142,59 @@ async function sendMessage() {
             // Need to fetch or create an epoch
             epoch = await getOrCreateEpoch(currentChatId, currentChatPeer);
         }
+
+        // Upload media files if any
+        if (filesToUpload.length > 0) {
+            // Show upload progress
+            const progressEl = document.createElement('div');
+            progressEl.className = 'upload-progress';
+            progressEl.id = 'upload-progress';
+            progressEl.innerHTML = `
+                <div class="upload-progress-bar"><div class="upload-progress-fill" style="width:0%"></div></div>
+                <div class="upload-progress-text">Encrypting and uploading files...</div>
+            `;
+            const messageFormEl = document.getElementById('message-form');
+            messageFormEl.parentNode.insertBefore(progressEl, messageFormEl);
+
+            try {
+                for (let i = 0; i < filesToUpload.length; i++) {
+                    const file = filesToUpload[i];
+                    const mediaId = await uploadMedia(file, currentChatId, epoch.key, (progress) => {
+                        const totalProgress = ((i + progress) / filesToUpload.length) * 100;
+                        const fill = progressEl.querySelector('.upload-progress-fill');
+                        const text = progressEl.querySelector('.upload-progress-text');
+                        if (fill) fill.style.width = totalProgress + '%';
+                        if (text) text.textContent = `Uploading ${file.name} (${i + 1}/${filesToUpload.length})...`;
+                    });
+                    mediaIds.push(mediaId);
+                }
+            } finally {
+                progressEl.remove();
+            }
+        }
         
         // Encrypt the message
-        const encrypted = await Crypto.encryptMessage(body, epoch.key);
+        const encrypted = await Crypto.encryptMessage(messageBody, epoch.key);
         
+        const payload = {
+            epoch_id: epoch.epochId,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            reply_id: currentReplyMessage ? currentReplyMessage.id : null
+        };
+
+        if (mediaIds.length > 0) {
+            payload.media_ids = mediaIds;
+        }
+
         await apiCall(`/chat/${currentChatId}/message`, {
             method: 'POST',
-            body: JSON.stringify({
-                epoch_id: epoch.epochId,
-                ciphertext: encrypted.ciphertext,
-                nonce: encrypted.nonce,
-                reply_id: currentReplyMessage ? currentReplyMessage.id : null
-            })
+            body: JSON.stringify(payload)
         });
         clearReplyTarget();
-        // If WebSocket is not open (e.g. connection dropped), fall back to HTTP fetch
+        // Keep active chat on WebSocket delivery; reconnect if needed
         if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
-            await loadMessages();
+            connectChatWebSocket(currentChatId);
         }
         // Otherwise the server broadcasts the new message via WebSocket
     } catch (error) {
@@ -1054,16 +1205,19 @@ async function sendMessage() {
             try {
                 KeyStore.epochKeys.delete(currentChatId);
                 const epoch = await getOrCreateEpoch(currentChatId, currentChatPeer);
-                const encrypted = await Crypto.encryptMessage(body, epoch.key);
+                const encrypted = await Crypto.encryptMessage(messageBody, epoch.key);
                 
+                const payload = {
+                    epoch_id: epoch.epochId,
+                    ciphertext: encrypted.ciphertext,
+                    nonce: encrypted.nonce,
+                    reply_id: currentReplyMessage ? currentReplyMessage.id : null
+                };
+                if (mediaIds.length > 0) payload.media_ids = mediaIds;
+
                 await apiCall(`/chat/${currentChatId}/message`, {
                     method: 'POST',
-                    body: JSON.stringify({
-                        epoch_id: epoch.epochId,
-                        ciphertext: encrypted.ciphertext,
-                        nonce: encrypted.nonce,
-                        reply_id: currentReplyMessage ? currentReplyMessage.id : null
-                    })
+                    body: JSON.stringify(payload)
                 });
                 clearReplyTarget();
                 return;
@@ -1073,16 +1227,19 @@ async function sendMessage() {
         } else if (error.message.includes('Epoch not initialized')) {
             try {
                 const epoch = await createEpoch(currentChatId, currentChatPeer);
-                const encrypted = await Crypto.encryptMessage(body, epoch.key);
+                const encrypted = await Crypto.encryptMessage(messageBody, epoch.key);
                 
+                const payload = {
+                    epoch_id: epoch.epochId,
+                    ciphertext: encrypted.ciphertext,
+                    nonce: encrypted.nonce,
+                    reply_id: currentReplyMessage ? currentReplyMessage.id : null
+                };
+                if (mediaIds.length > 0) payload.media_ids = mediaIds;
+
                 await apiCall(`/chat/${currentChatId}/message`, {
                     method: 'POST',
-                    body: JSON.stringify({
-                        epoch_id: epoch.epochId,
-                        ciphertext: encrypted.ciphertext,
-                        nonce: encrypted.nonce,
-                        reply_id: currentReplyMessage ? currentReplyMessage.id : null
-                    })
+                    body: JSON.stringify(payload)
                 });
                 clearReplyTarget();
                 return;
@@ -1095,6 +1252,382 @@ async function sendMessage() {
         
         messageInput.value = body;
     }
+}
+
+// ==================== MEDIA MODULE ====================
+
+const CHUNK_MAX_SIZE = 250 * 1024 * 1024; // ~250 MiB payload per chunk (leaving room for metadata within 256 MiB)
+const MEDIA_AUTOLOAD_PERSIST_MAX_BYTES = 256 * 1024 * 1024; // 256 MiB
+
+const MediaCache = {
+    dbPromise: null,
+
+    open() {
+        if (this.dbPromise) return this.dbPromise;
+
+        this.dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open('omnis-media-cache', 1);
+
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains('attachments')) {
+                    db.createObjectStore('attachments', { keyPath: 'id' });
+                }
+            };
+
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('Failed to open media cache'));
+        });
+
+        return this.dbPromise;
+    },
+
+    async get(id) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('attachments', 'readonly');
+            const store = tx.objectStore('attachments');
+            const request = store.get(id);
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error || new Error('Failed reading media cache'));
+        });
+    },
+
+    async put(record) {
+        const db = await this.open();
+        return new Promise((resolve) => {
+            const tx = db.transaction('attachments', 'readwrite');
+            const store = tx.objectStore('attachments');
+            store.put(record);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        });
+    }
+};
+
+const attachmentLoadInFlight = new Map();
+
+function generateUploadId() {
+    return crypto.randomUUID();
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function getFileIcon(mimeType) {
+    if (!mimeType) return 'fa-solid fa-file';
+    if (mimeType.startsWith('image/')) return 'fa-solid fa-image';
+    if (mimeType.startsWith('video/')) return 'fa-solid fa-video';
+    if (mimeType.startsWith('audio/')) return 'fa-solid fa-music';
+    if (mimeType.includes('pdf')) return 'fa-solid fa-file-pdf';
+    if (mimeType.includes('zip') || mimeType.includes('rar') || mimeType.includes('tar'))
+        return 'fa-solid fa-file-zipper';
+    return 'fa-solid fa-file';
+}
+
+function isPreviewable(mimeType) {
+    if (!mimeType) return false;
+    return mimeType.startsWith('image/') || mimeType.startsWith('video/') || mimeType.startsWith('audio/');
+}
+
+// Split file into chunks
+function chunkFile(arrayBuffer) {
+    const chunks = [];
+    const total = Math.max(1, Math.ceil(arrayBuffer.byteLength / CHUNK_MAX_SIZE));
+    for (let i = 0; i < total; i++) {
+        const start = i * CHUNK_MAX_SIZE;
+        const end = Math.min(start + CHUNK_MAX_SIZE, arrayBuffer.byteLength);
+        chunks.push(arrayBuffer.slice(start, end));
+    }
+    return chunks;
+}
+
+function isPdfMimeType(mimeType = '') {
+    const value = String(mimeType).toLowerCase();
+    return value === 'application/pdf' || value.endsWith('/pdf') || value.includes('pdf');
+}
+
+/**
+ * Render the first page of a PDF blob URL onto a <canvas> element.
+ * Returns the canvas immediately; the actual paint happens asynchronously.
+ * @param {string} blobUrl - Object URL pointing to the PDF blob
+ * @param {string} className - CSS class(es) for the canvas
+ * @param {number} [maxWidth=240] - Maximum pixel width for the thumbnail
+ * @returns {HTMLCanvasElement}
+ */
+function renderPdfThumbnail(blobUrl, className, maxWidth = 240) {
+    const canvas = document.createElement('canvas');
+    canvas.className = className;
+    canvas.title = 'PDF page 1';
+
+    (async () => {
+        try {
+            if (typeof pdfjsLib === 'undefined') {
+                console.warn('pdf.js not loaded – cannot render PDF thumbnail');
+                return;
+            }
+            pdfjsLib.GlobalWorkerOptions.workerSrc =
+                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+            const pdf = await pdfjsLib.getDocument(blobUrl).promise;
+            const page = await pdf.getPage(1);
+
+            const unscaled = page.getViewport({ scale: 1 });
+            const scale = Math.min(maxWidth / unscaled.width, 1);
+            const viewport = page.getViewport({ scale });
+
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+
+            await page.render({
+                canvasContext: canvas.getContext('2d'),
+                viewport,
+            }).promise;
+
+            pdf.destroy();
+        } catch (err) {
+            console.error('PDF thumbnail render failed:', err);
+        }
+    })();
+
+    return canvas;
+}
+
+// Upload all chunks for a single file; returns the last media_id (for media_ids reference)
+async function uploadMedia(file, chatId, epochKey, onProgress) {
+    // Read file
+    const arrayBuffer = await file.arrayBuffer();
+
+    // Encrypt entire file
+    const { encrypted, nonce } = await Crypto.encryptFile(arrayBuffer, epochKey);
+
+    // Chunk the encrypted blob
+    const chunks = chunkFile(encrypted.buffer);
+    const totalChunks = chunks.length;
+    const uploadId = generateUploadId();
+
+    let lastMediaId = null;
+
+    for (let i = 0; i < totalChunks; i++) {
+        const formData = new FormData();
+        formData.append('file', new Blob([chunks[i]]), file.name);
+        formData.append('chat_id', String(chatId));
+        formData.append('mime_type', file.type || 'application/octet-stream');
+        formData.append('nonce', nonce);
+        formData.append('chunk_index', String(i));
+        formData.append('total_chunks', String(totalChunks));
+        formData.append('upload_id', uploadId);
+
+        const response = await fetch(`${API_BASE}/media/upload`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'X-Device-ID': deviceId
+            },
+            body: formData
+        });
+
+        if (!response.ok) {
+            if (response.status === 401) handleAuthBroken();
+            const err = await response.json().catch(() => ({ detail: 'Upload failed' }));
+            throw new Error(err.detail || `Upload failed (chunk ${i})`);
+        }
+
+        const result = await response.json();
+        lastMediaId = result.media_id;
+
+        if (onProgress) {
+            onProgress((i + 1) / totalChunks);
+        }
+    }
+
+    return lastMediaId;
+}
+
+// Download and decrypt a single attachment
+async function downloadAttachment(attachment, epochKey) {
+    // Sort chunks by index
+    const sortedChunks = [...attachment.chunks].sort((a, b) => a.chunk_index - b.chunk_index);
+
+    // Download each chunk
+    const chunkBuffers = [];
+    for (const chunk of sortedChunks) {
+        const response = await fetch(`${API_BASE}/media/download/${chunk.media_id}`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'X-Device-ID': deviceId
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to download media chunk');
+        }
+
+        chunkBuffers.push(await response.arrayBuffer());
+    }
+
+    // Reassemble
+    const totalSize = chunkBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const buf of chunkBuffers) {
+        combined.set(new Uint8Array(buf), offset);
+        offset += buf.byteLength;
+    }
+
+    // Decrypt
+    const decrypted = await Crypto.decryptFile(combined.buffer, attachment.nonce, epochKey);
+    return decrypted;
+}
+
+function shouldAutoloadAndPersistAttachment(attachment) {
+    const size = attachment?.total_size || 0;
+    return size > 0 && size <= MEDIA_AUTOLOAD_PERSIST_MAX_BYTES;
+}
+
+function getAttachmentCacheKey(attachment, epochId) {
+    const uploadId = attachment?.upload_id || 'unknown-upload';
+    const nonce = attachment?.nonce || 'no-nonce';
+    return `${currentChatId}:${epochId}:${uploadId}:${nonce}`;
+}
+
+async function resolveAttachmentBlob(attachment, epochId) {
+    const cacheKey = getAttachmentCacheKey(attachment, epochId);
+
+    if (attachmentLoadInFlight.has(cacheKey)) {
+        return attachmentLoadInFlight.get(cacheKey);
+    }
+
+    const loadPromise = (async () => {
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            try {
+                const cached = await MediaCache.get(cacheKey);
+                if (cached?.blob) {
+                    return cached.blob;
+                }
+            } catch (error) {
+                console.warn('Media cache read failed:', error);
+            }
+        }
+
+        const epochKey = await getEpochKeyForAttachment(epochId);
+        const decrypted = await downloadAttachment(attachment, epochKey);
+        const mimeType = attachment?.mime_type || 'application/octet-stream';
+        const blob = new Blob([decrypted], { type: mimeType });
+
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            try {
+                await MediaCache.put({
+                    id: cacheKey,
+                    upload_id: attachment.upload_id,
+                    epoch_id: epochId,
+                    total_size: attachment.total_size || blob.size,
+                    mime_type: mimeType,
+                    blob,
+                    cached_at: Date.now()
+                });
+            } catch (error) {
+                console.warn('Media cache write failed:', error);
+            }
+        }
+
+        return blob;
+    })();
+
+    attachmentLoadInFlight.set(cacheKey, loadPromise);
+    try {
+        return await loadPromise;
+    } finally {
+        attachmentLoadInFlight.delete(cacheKey);
+    }
+}
+
+// ==================== FILE ATTACHMENT UI ====================
+
+function handleFileSelect() {
+    const files = Array.from(fileInput.files);
+    if (files.length === 0) return;
+
+    for (const file of files) {
+        pendingAttachments.push(file);
+    }
+
+    fileInput.value = '';
+    renderAttachmentPreviews();
+}
+
+function renderAttachmentPreviews() {
+    attachmentPreview.innerHTML = '';
+
+    if (pendingAttachments.length === 0) {
+        attachmentPreview.classList.add('hidden');
+        return;
+    }
+
+    attachmentPreview.classList.remove('hidden');
+
+    pendingAttachments.forEach((file, index) => {
+        const thumb = document.createElement('div');
+        thumb.className = 'attachment-thumb';
+
+        const isImage = file.type.startsWith('image/');
+        const isVideo = file.type.startsWith('video/');
+        const isPdf = isPdfMimeType(file.type) || file.name.toLowerCase().endsWith('.pdf');
+
+        if (isImage) {
+            const img = document.createElement('img');
+            img.src = URL.createObjectURL(file);
+            img.onload = () => URL.revokeObjectURL(img.src);
+            thumb.appendChild(img);
+        } else if (isVideo) {
+            const vid = document.createElement('video');
+            vid.src = URL.createObjectURL(file);
+            vid.onloadeddata = () => URL.revokeObjectURL(vid.src);
+            thumb.appendChild(vid);
+        } else if (isPdf) {
+            thumb.classList.add('pdf-thumb');
+            const pdfUrl = URL.createObjectURL(file);
+            const pdfCanvas = renderPdfThumbnail(pdfUrl, 'attachment-thumb-pdf-canvas', 40);
+            thumb.appendChild(pdfCanvas);
+        } else {
+            const icon = document.createElement('div');
+            icon.className = 'file-icon';
+            icon.innerHTML = `<i class="${getFileIcon(file.type)}"></i>`;
+            thumb.appendChild(icon);
+        }
+
+        const info = document.createElement('div');
+        info.className = 'file-info';
+        info.innerHTML = `
+            <span class="file-name">${escapeHtml(file.name)}</span>
+            <span class="file-size">${formatFileSize(file.size)}</span>
+        `;
+        thumb.appendChild(info);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'remove-attachment';
+        removeBtn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+        removeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            pendingAttachments.splice(index, 1);
+            renderAttachmentPreviews();
+        });
+        thumb.appendChild(removeBtn);
+
+        attachmentPreview.appendChild(thumb);
+    });
+}
+
+function clearAttachments() {
+    pendingAttachments = [];
+    fileInput.value = '';
+    attachmentPreview.innerHTML = '';
+    attachmentPreview.classList.add('hidden');
 }
 
 // ==================== WEBSOCKET ====================
@@ -1252,7 +1785,8 @@ async function decryptMessageBatch(messages) {
 function appendMessage(msg) {
     const isSent = msg.sender_id === currentUserId;
     const div = document.createElement('div');
-    div.className = `message ${isSent ? 'sent' : 'received'}`;
+    const hasAttachments = msg.attachments && msg.attachments.length > 0;
+    div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}`;
     div.dataset.msgId = msg.id;
     div.dataset.senderId = msg.sender_id;
 
@@ -1288,6 +1822,17 @@ function appendMessage(msg) {
         <div class="time">${time}</div>
     `;
 
+    // Render attachments
+    if (hasAttachments) {
+        const attachContainer = document.createElement('div');
+        attachContainer.className = 'message-attachments';
+        msg.attachments.forEach(att => {
+            renderAttachmentInMessage(attachContainer, att, msg.epoch_id);
+        });
+        const timeEl = div.querySelector('.time');
+        div.insertBefore(attachContainer, timeEl);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'message-actions';
     const replyBtn = document.createElement('button');
@@ -1304,6 +1849,226 @@ function appendMessage(msg) {
 
     messagesContainer.appendChild(div);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+// ==================== ATTACHMENT RENDERING ====================
+
+function renderAttachmentInMessage(container, attachment, epochId) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'msg-attachment';
+
+    const mime = attachment.mime_type || '';
+    const totalSize = attachment.total_size || 0;
+
+    if (mime.startsWith('image/')) {
+        // Lazy-load image: show placeholder, download + decrypt on click or auto
+        const placeholder = document.createElement('div');
+        placeholder.className = 'msg-attachment-file';
+        placeholder.innerHTML = `
+            <span class="file-icon"><i class="fa-solid fa-image"></i></span>
+            <div class="file-details">
+                <span class="file-name">Image</span>
+                <span class="file-meta">${formatFileSize(totalSize)} · Click to load</span>
+            </div>
+            <span class="download-icon"><i class="fa-solid fa-download"></i></span>
+        `;
+        placeholder.addEventListener('click', async () => {
+            placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-spinner"></i> Decrypting image...</div>`;
+            try {
+                const blob = await resolveAttachmentBlob(attachment, epochId);
+                const url = URL.createObjectURL(blob);
+
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = 'Image';
+                img.addEventListener('click', () => openLightbox(url));
+                wrapper.innerHTML = '';
+                wrapper.appendChild(img);
+            } catch (e) {
+                console.error('Failed to load image:', e);
+                placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-triangle-exclamation"></i> Failed to load image</div>`;
+            }
+        });
+        // Auto-load images up to 256 MiB and persist locally
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            wrapper.appendChild(placeholder);
+            placeholder.click();
+        } else {
+            wrapper.appendChild(placeholder);
+        }
+    } else if (mime.startsWith('video/')) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'msg-attachment-file';
+        placeholder.innerHTML = `
+            <span class="file-icon"><i class="fa-solid fa-video"></i></span>
+            <div class="file-details">
+                <span class="file-name">Video</span>
+                <span class="file-meta">${formatFileSize(totalSize)} · Click to load</span>
+            </div>
+            <span class="download-icon"><i class="fa-solid fa-download"></i></span>
+        `;
+        placeholder.addEventListener('click', async () => {
+            placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-spinner"></i> Decrypting video...</div>`;
+            try {
+                const blob = await resolveAttachmentBlob(attachment, epochId);
+                const url = URL.createObjectURL(blob);
+
+                const video = document.createElement('video');
+                video.src = url;
+                video.controls = true;
+                video.preload = 'metadata';
+                wrapper.innerHTML = '';
+                wrapper.appendChild(video);
+            } catch (e) {
+                console.error('Failed to load video:', e);
+                placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-triangle-exclamation"></i> Failed to load video</div>`;
+            }
+        });
+        wrapper.appendChild(placeholder);
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            placeholder.click();
+        }
+    } else if (mime.startsWith('audio/')) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'msg-attachment-file';
+        placeholder.innerHTML = `
+            <span class="file-icon"><i class="fa-solid fa-music"></i></span>
+            <div class="file-details">
+                <span class="file-name">Audio</span>
+                <span class="file-meta">${formatFileSize(totalSize)} · Click to load</span>
+            </div>
+            <span class="download-icon"><i class="fa-solid fa-download"></i></span>
+        `;
+        placeholder.addEventListener('click', async () => {
+            placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-spinner"></i> Decrypting audio...</div>`;
+            try {
+                const blob = await resolveAttachmentBlob(attachment, epochId);
+                const url = URL.createObjectURL(blob);
+
+                const audio = document.createElement('audio');
+                audio.src = url;
+                audio.controls = true;
+                wrapper.innerHTML = '';
+                wrapper.appendChild(audio);
+            } catch (e) {
+                console.error('Failed to load audio:', e);
+                placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-triangle-exclamation"></i> Failed to load audio</div>`;
+            }
+        });
+        wrapper.appendChild(placeholder);
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            placeholder.click();
+        }
+    } else if (isPdfMimeType(mime)) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'msg-attachment-file';
+        placeholder.innerHTML = `
+            <span class="file-icon"><i class="fa-solid fa-file-pdf"></i></span>
+            <div class="file-details">
+                <span class="file-name">PDF</span>
+                <span class="file-meta">${formatFileSize(totalSize)} · Click to load preview</span>
+            </div>
+            <span class="download-icon"><i class="fa-solid fa-file-pdf"></i></span>
+        `;
+        placeholder.addEventListener('click', async () => {
+            placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-spinner"></i> Decrypting PDF...</div>`;
+            try {
+                const blob = await resolveAttachmentBlob(attachment, epochId);
+                const url = URL.createObjectURL(blob);
+
+                const pdfContainer = document.createElement('div');
+                pdfContainer.className = 'msg-attachment-pdf';
+
+                const thumbCanvas = renderPdfThumbnail(url, 'msg-attachment-pdf-thumb', 320);
+
+                const actions = document.createElement('div');
+                actions.className = 'msg-attachment-pdf-actions';
+
+                const openLink = document.createElement('a');
+                openLink.className = 'msg-attachment-pdf-link';
+                openLink.href = url;
+                openLink.target = '_blank';
+                openLink.rel = 'noopener noreferrer';
+                openLink.innerHTML = '<i class="fa-solid fa-up-right-from-square"></i> Open full PDF';
+
+                actions.appendChild(openLink);
+                pdfContainer.appendChild(thumbCanvas);
+                pdfContainer.appendChild(actions);
+
+                wrapper.innerHTML = '';
+                wrapper.appendChild(pdfContainer);
+            } catch (e) {
+                console.error('Failed to load PDF preview:', e);
+                placeholder.innerHTML = `<div class="msg-attachment-loading"><i class="fa-solid fa-triangle-exclamation"></i> Failed to load PDF</div>`;
+            }
+        });
+        wrapper.appendChild(placeholder);
+        if (shouldAutoloadAndPersistAttachment(attachment)) {
+            placeholder.click();
+        }
+    } else {
+        // Generic file download
+        const fileEl = document.createElement('div');
+        fileEl.className = 'msg-attachment-file';
+        fileEl.innerHTML = `
+            <span class="file-icon"><i class="${getFileIcon(mime)}"></i></span>
+            <div class="file-details">
+                <span class="file-name">File</span>
+                <span class="file-meta">${formatFileSize(totalSize)} · ${mime || 'Unknown type'}</span>
+            </div>
+            <span class="download-icon"><i class="fa-solid fa-download"></i></span>
+        `;
+        fileEl.addEventListener('click', async () => {
+            fileEl.querySelector('.download-icon').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+            try {
+                const blob = await resolveAttachmentBlob(attachment, epochId);
+                const url = URL.createObjectURL(blob);
+
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'download';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                fileEl.querySelector('.download-icon').innerHTML = '<i class="fa-solid fa-check"></i>';
+                setTimeout(() => {
+                    fileEl.querySelector('.download-icon').innerHTML = '<i class="fa-solid fa-download"></i>';
+                }, 2000);
+            } catch (e) {
+                console.error('Failed to download file:', e);
+                fileEl.querySelector('.download-icon').innerHTML = '<i class="fa-solid fa-download"></i>';
+                alert('Failed to download file');
+            }
+        });
+        wrapper.appendChild(fileEl);
+    }
+
+    container.appendChild(wrapper);
+}
+
+async function getEpochKeyForAttachment(epochId) {
+    const cached = KeyStore.getEpochKey(currentChatId, epochId);
+    if (cached) return cached;
+    // Fetch if not cached
+    if (currentChatPeer) {
+        const result = await fetchEpochKey(currentChatId, epochId, currentChatPeer);
+        return result.key;
+    }
+    throw new Error('Cannot resolve epoch key for attachment');
+}
+
+function openLightbox(imageUrl) {
+    const lightbox = document.createElement('div');
+    lightbox.className = 'lightbox';
+    const img = document.createElement('img');
+    img.src = imageUrl;
+    lightbox.appendChild(img);
+    lightbox.addEventListener('click', () => {
+        lightbox.remove();
+    });
+    document.body.appendChild(lightbox);
 }
 
 // ==================== ACCOUNT SECTION ====================

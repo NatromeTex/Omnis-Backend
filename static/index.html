@@ -6,6 +6,7 @@
     <title>Omnis Chat</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
     <div class="app-container">
@@ -44,7 +45,10 @@
                         <button id="logout-btn" class="btn small">Logout</button>
                     </div>
                     <div class="new-chat">
-                        <input type="text" id="new-chat-username" placeholder="Username to chat with">
+                        <div class="search-wrapper">
+                            <input type="text" id="new-chat-username" placeholder="Search users..." autocomplete="off">
+                            <div id="search-results" class="search-results hidden"></div>
+                        </div>
                         <button id="new-chat-btn" class="btn primary small">+</button>
                     </div>
                     <div id="chat-list" class="chat-list"></div>
@@ -77,8 +81,13 @@
                             </div>
                             <div id="reply-preview" class="reply-preview"></div>
                         </div>
+                        <div id="attachment-preview" class="attachment-preview hidden"></div>
                         <form id="message-form" class="message-form">
-                            <input type="text" id="message-input" placeholder="Type a message..." required>
+                            <input type="file" id="file-input" multiple hidden>
+                            <button type="button" id="attach-btn" class="btn attach-btn" title="Attach file">
+                                <i class="fa-solid fa-paperclip"></i>
+                            </button>
+                            <input type="text" id="message-input" placeholder="Type a message...">
                             <button type="submit" class="btn primary">Send</button>
                         </form>
                     </div>

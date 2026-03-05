@@ -3,9 +3,12 @@ import hashlib
 import hmac
 import json
 import os
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect
+import uuid
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc, case
 from argon2 import PasswordHasher
@@ -15,10 +18,13 @@ from datetime import datetime, timedelta, timezone
 from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest
 import secrets
 
-from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch
+from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR
+
+MAX_CHUNK_SIZE = 256 * 1024 * 1024  # 256 MiB
 
 app = FastAPI()
 
+app.mount("/site", StaticFiles(directory="static", html=True), name="site-static")
 app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
 app.add_middleware(
@@ -132,6 +138,13 @@ async def require_auth(
 async def read_root():
     return {"ping": "pong"}
 
+@app.get("/site")
+async def site_root():
+    return RedirectResponse(url="/site/")
+
+@app.get("/version")
+async def get_version():
+    return {"version": "50"}
 
 # Authentication endpoints
 @app.post("/auth/signup", status_code=201)
@@ -456,6 +469,237 @@ async def get_public_key(
         "identity_pub": user_key.identity_pub,
     }
 
+# ── Media endpoints ───────────────────────────────────────────────────
+
+@app.post("/media/upload", status_code=201)
+async def upload_media(
+    file: UploadFile = File(...),
+    chat_id: int = Form(...),
+    mime_type: str = Form(...),
+    nonce: str = Form(...),
+    chunk_index: int = Form(0),
+    total_chunks: int = Form(1),
+    upload_id: str = Form(...),
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    # verify chat membership
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == chat_id,
+            or_(
+                Chat.user_a_id == user.id,
+                Chat.user_b_id == user.id,
+            ),
+        )
+        .one_or_none()
+    )
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # validate chunk parameters
+    if chunk_index < 0 or chunk_index >= total_chunks:
+        raise HTTPException(status_code=400, detail="Invalid chunk_index")
+
+    if total_chunks < 1:
+        raise HTTPException(status_code=400, detail="total_chunks must be >= 1")
+
+    # read file content and enforce 256 MiB chunk limit
+    content = await file.read()
+    file_size = len(content)
+
+    if file_size > MAX_CHUNK_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Chunk exceeds maximum size of 256 MiB ({MAX_CHUNK_SIZE} bytes)",
+        )
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # check for duplicate chunk
+    existing_chunk = (
+        db.query(Media)
+        .filter(
+            Media.upload_id == upload_id,
+            Media.chunk_index == chunk_index,
+        )
+        .one_or_none()
+    )
+
+    if existing_chunk:
+        raise HTTPException(status_code=409, detail="Chunk already uploaded")
+
+    # store on disk: uploads/<chat_id>/<upload_id>_<chunk_index>
+    chat_dir = os.path.join(UPLOAD_DIR, str(chat_id))
+    os.makedirs(chat_dir, exist_ok=True)
+
+    filename = f"{upload_id}_{chunk_index}"
+    disk_path = os.path.join(chat_dir, filename)
+
+    with open(disk_path, "wb") as f:
+        f.write(content)
+
+    media = Media(
+        uploader_id=user.id,
+        chat_id=chat_id,
+        mime_type=mime_type,
+        file_path=disk_path,
+        file_size=file_size,
+        nonce=nonce,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        upload_id=upload_id,
+    )
+
+    db.add(media)
+    db.commit()
+    db.refresh(media)
+
+    # check overall upload completeness
+    uploaded_count = (
+        db.query(func.count(Media.id))
+        .filter(Media.upload_id == upload_id)
+        .scalar()
+    )
+
+    return {
+        "media_id": media.id,
+        "upload_id": upload_id,
+        "chunk_index": chunk_index,
+        "chunks_uploaded": uploaded_count,
+        "total_chunks": total_chunks,
+        "complete": uploaded_count == total_chunks,
+    }
+
+
+@app.get("/media/{media_id}/meta")
+async def get_media_meta(
+    media_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    media = db.query(Media).filter(Media.id == media_id).one_or_none()
+
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    # verify chat membership
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == media.chat_id,
+            or_(
+                Chat.user_a_id == user.id,
+                Chat.user_b_id == user.id,
+            ),
+        )
+        .one_or_none()
+    )
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    # return all chunks for this upload
+    chunks = (
+        db.query(Media)
+        .filter(Media.upload_id == media.upload_id)
+        .order_by(Media.chunk_index)
+        .all()
+    )
+
+    return {
+        "upload_id": media.upload_id,
+        "mime_type": media.mime_type,
+        "total_chunks": media.total_chunks,
+        "nonce": media.nonce,
+        "chunks": [
+            {
+                "media_id": c.id,
+                "chunk_index": c.chunk_index,
+                "file_size": c.file_size,
+            }
+            for c in chunks
+        ],
+    }
+
+
+@app.get("/media/download/{media_id}")
+async def download_media(
+    media_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    media = db.query(Media).filter(Media.id == media_id).one_or_none()
+
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    # verify chat membership
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == media.chat_id,
+            or_(
+                Chat.user_a_id == user.id,
+                Chat.user_b_id == user.id,
+            ),
+        )
+        .one_or_none()
+    )
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    if not os.path.exists(media.file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(
+        path=media.file_path,
+        media_type="application/octet-stream",
+        filename=f"{media.upload_id}_{media.chunk_index}",
+    )
+
+
+def _attachments_for_message(message_id: int, db: Session) -> list[dict]:
+    """Return media attachment metadata for a message."""
+    rows = (
+        db.query(MessageMedia, Media)
+        .join(Media, MessageMedia.media_id == Media.id)
+        .filter(MessageMedia.message_id == message_id)
+        .all()
+    )
+
+    # group by upload_id
+    uploads: dict[str, list] = {}
+    for _mm, m in rows:
+        uploads.setdefault(m.upload_id, []).append(m)
+
+    result = []
+    for upload_id, chunks in uploads.items():
+        chunks.sort(key=lambda c: c.chunk_index)
+        first = chunks[0]
+        result.append({
+            "upload_id": upload_id,
+            "mime_type": first.mime_type,
+            "nonce": first.nonce,
+            "total_chunks": first.total_chunks,
+            "total_size": sum(c.file_size for c in chunks),
+            "chunks": [
+                {
+                    "media_id": c.id,
+                    "chunk_index": c.chunk_index,
+                    "file_size": c.file_size,
+                }
+                for c in chunks
+            ],
+        })
+
+    return result
+
+
 # ── WebSocket helper: authenticate from query params ─────────────────
 
 def ws_authenticate(token: str, device_id: str, db: Session) -> User | None:
@@ -535,6 +779,7 @@ async def chat_ws(
                 "ciphertext": m.ciphertext,
                 "nonce": m.nonce,
                 "created_at": m.created_at.isoformat(),
+                "attachments": _attachments_for_message(m.id, db),
             }
             for m in messages
         ]
@@ -646,6 +891,7 @@ async def fetch_chat(
             "ciphertext": m.ciphertext,
             "nonce": m.nonce,
             "created_at": m.created_at,
+            "attachments": _attachments_for_message(m.id, db),
         }
         for m in messages
     ]
@@ -888,8 +1134,63 @@ async def message(
     )
 
     db.add(msg)
+    db.flush()
+
+    # link media attachments
+    if payload.media_ids:
+        for mid in payload.media_ids:
+            media = (
+                db.query(Media)
+                .filter(
+                    Media.id == mid,
+                    Media.chat_id == chat_id,
+                )
+                .one_or_none()
+            )
+
+            if not media:
+                db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Media {mid} not found or does not belong to this chat",
+                )
+
+            # ensure all chunks are uploaded
+            uploaded = (
+                db.query(func.count(Media.id))
+                .filter(Media.upload_id == media.upload_id)
+                .scalar()
+            )
+
+            if uploaded < media.total_chunks:
+                db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Upload {media.upload_id} is incomplete ({uploaded}/{media.total_chunks} chunks)",
+                )
+
+            # link all chunks of this upload to the message
+            upload_chunks = (
+                db.query(Media)
+                .filter(Media.upload_id == media.upload_id)
+                .all()
+            )
+            for chunk in upload_chunks:
+                existing_link = (
+                    db.query(MessageMedia)
+                    .filter(
+                        MessageMedia.message_id == msg.id,
+                        MessageMedia.media_id == chunk.id,
+                    )
+                    .one_or_none()
+                )
+                if not existing_link:
+                    db.add(MessageMedia(message_id=msg.id, media_id=chunk.id))
+
     db.commit()
     db.refresh(msg)
+
+    attachments = _attachments_for_message(msg.id, db)
 
     # broadcast to WebSocket subscribers of this chat
     ws_payload = {
@@ -902,6 +1203,7 @@ async def message(
             "ciphertext": msg.ciphertext,
             "nonce": msg.nonce,
             "created_at": msg.created_at.isoformat(),
+            "attachments": attachments,
         },
     }
     asyncio.ensure_future(manager.broadcast(chat_id, ws_payload))
@@ -910,4 +1212,5 @@ async def message(
         "id": msg.id,
         "epoch_id": msg.epoch_id,
         "created_at": msg.created_at,
+        "attachments": attachments,
     }

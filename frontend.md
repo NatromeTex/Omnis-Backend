@@ -138,6 +138,96 @@ The server **never sees plaintext messages or identity private keys**. It only s
   - Use the latest epoch key to AES‑GCM encrypt the UTF‑8 message body.
   - Post ciphertext, nonce, and epoch id via `/chat/{chat_id}/message`.
 
+### 3.5 Media Attachments
+
+Media files (images, GIFs, audio, video, and arbitrary large files) are handled
+separately from text messages to avoid blocking the chat pipeline with large
+uploads. The workflow is:
+
+#### Upload flow
+
+1. The client **encrypts** the file locally using AES‑GCM with a **12‑byte
+   random nonce** and the current epoch key (same key used for message bodies).
+2. The encrypted blob is split into chunk envelopes where
+  `encrypted_chunk_bytes + chunk_metadata_bytes <= 256 MiB`.
+   - The client generates a unique `upload_id` (UUID v4) to group all chunks.
+3. Each chunk is uploaded individually via `POST /media/upload` as a streamed
+  multipart request:
+   `multipart/form-data`, including:
+   - `file` — the encrypted binary chunk
+   - `chat_id` — the chat this media belongs to
+   - `mime_type` — the original MIME type (e.g. `image/png`, `video/mp4`)
+   - `nonce` — the base64 encryption nonce (same for all chunks of one file)
+   - `chunk_index` — 0-based chunk number
+   - `total_chunks` — total number of chunks
+   - `upload_id` — the UUID grouping chunks together
+4. The server responds with a `media_id` for each successfully uploaded chunk,
+   plus a `complete` flag indicating whether all chunks have arrived.
+5. Uploads can be retried individually per chunk without re-uploading the
+   entire file.
+
+#### Attaching media to a message
+
+1. After all chunks are uploaded (the server confirms `complete: true`), the
+   client sends a message via `POST /chat/{chat_id}/message` with the
+   `media_ids` field containing one `media_id` per attached file (any chunk id
+   from the upload suffices; the server resolves all chunks via `upload_id`).
+2. A single message may reference **multiple** media uploads (e.g. several
+   images attached to one message).
+
+#### Receiving and downloading attachments
+
+1. When a message arrives (via WebSocket `new_message` frame, REST
+   `/chat/fetch/{chat_id}`, or WebSocket `history`), the `attachments` array
+   is included in the message payload.
+2. Each attachment object contains:
+   - `upload_id` — unique identifier for the upload
+   - `mime_type` — original MIME type
+   - `nonce` — encryption nonce
+   - `total_chunks` and `total_size` — for progress display
+   - `chunks[]` — array of `{ media_id, chunk_index, file_size }`
+3. The client downloads each chunk via streaming
+  `GET /media/download/{media_id}` responses.
+4. After downloading all chunks, the client **reassembles** them in
+   `chunk_index` order and **decrypts** the concatenated blob using the epoch
+   key and the provided nonce.
+5. Metadata for an upload can also be fetched separately via
+   `GET /media/{media_id}/meta`.
+
+#### Encryption requirements
+
+- Media **MUST** be encrypted client‑side before upload using the **current
+  epoch key** and AES‑GCM.
+- The encryption nonce **MUST** be unique per file upload.
+- The server stores only the encrypted blob and never decrypts media.
+- The nonce is stored in the media metadata and included in attachment payloads
+  so the receiving client can decrypt.
+
+#### Size limits
+
+- Each upload envelope **MUST NOT** exceed **256 MiB** (`268435456` bytes),
+  where envelope size is encrypted chunk bytes plus multipart metadata.
+  The server rejects oversized uploads with HTTP `413`.
+- There is no server-enforced limit on total file size, but clients should
+  display appropriate progress UI for multi-chunk uploads and downloads.
+
+#### Pipeline summary (normative)
+
+Media pipeline:
+
+1. Media file -> chunk.
+2. Chunk + chunk metadata (envelope) limited to 256 MiB total.
+3. Encrypt chunk payload client-side.
+4. Stream upload each encrypted chunk envelope via `POST /media/upload`.
+5. Attach returned `media_id` references in `POST /chat/{chat_id}/message`.
+
+Download pipeline:
+
+1. Read message `attachments[]`.
+2. Stream-download each chunk from `GET /media/download/{media_id}`.
+3. Reassemble by `chunk_index`.
+4. Decrypt reassembled blob using attachment `nonce`.
+
 ---
 
 ## 4. Cryptographic Implementations by Language

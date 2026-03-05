@@ -111,6 +111,60 @@ class Chat(Base):
     )
 
 
+class Media(Base):
+    __tablename__ = "media"
+
+    id = Column(Integer, primary_key=True)
+    uploader_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chat_id = Column(
+        Integer,
+        ForeignKey("chats.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    mime_type = Column(String(128), nullable=False)
+    file_path = Column(Text, nullable=False)
+    file_size = Column(Integer, nullable=False)  # size in bytes
+    nonce = Column(String(48), nullable=False)  # client-side encryption nonce
+    chunk_index = Column(Integer, nullable=False, default=0)
+    total_chunks = Column(Integer, nullable=False, default=1)
+    upload_id = Column(String(64), nullable=False)  # groups chunks together
+
+    created_at = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_media_upload_id", "upload_id"),
+        Index("ix_media_uploader", "uploader_id"),
+    )
+
+
+class MessageMedia(Base):
+    """Join table linking messages to media attachments."""
+    __tablename__ = "message_media"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(
+        Integer,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    media_id = Column(
+        Integer,
+        ForeignKey("media.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_message_media_message", "message_id"),
+        UniqueConstraint("message_id", "media_id"),
+    )
+
+
 class Message(Base):
     __tablename__ = "messages"
 
@@ -142,5 +196,11 @@ class Message(Base):
         Index("ix_messages_reply_id", "reply_id"),
     )
 
+
+UPLOAD_DIR = "uploads"
+
+
 def init_db():
+    import os
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     Base.metadata.create_all(bind=engine)

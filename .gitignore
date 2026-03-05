@@ -135,3 +135,6 @@ cython_debug/
 
 # database
 *.db
+
+# media uploads
+uploads/*

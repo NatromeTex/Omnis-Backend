@@ -87,11 +87,60 @@ CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
     sender_id INTEGER NOT NULL,
-    body TEXT NOT NULL,
+    reply_id INTEGER,
+    epoch_id INTEGER,
+    ciphertext TEXT NOT NULL,
+    nonce TEXT NOT NULL,
     created_at INTEGER NOT NULL,
 
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
-    FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (reply_id) REFERENCES messages(id) ON DELETE SET NULL,
+    FOREIGN KEY (epoch_id) REFERENCES chat_epochs(id)
+);
+```
+
+---
+
+## media
+
+Encrypted media chunks stored on disk. Files are sharded into chunks of at most
+256 MiB each. All chunks of one logical file share the same `upload_id`.
+
+```sql
+CREATE TABLE media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uploader_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    mime_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,         -- size in bytes
+    nonce TEXT NOT NULL,                 -- client-side encryption nonce
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    total_chunks INTEGER NOT NULL DEFAULT 1,
+    upload_id TEXT NOT NULL,             -- groups chunks of same file
+    created_at INTEGER NOT NULL,
+
+    FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);
+```
+
+---
+
+## message_media
+
+Join table linking messages to their media attachments.
+
+```sql
+CREATE TABLE message_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    media_id INTEGER NOT NULL,
+
+    UNIQUE(message_id, media_id),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
 );
 ```
 
@@ -102,8 +151,12 @@ CREATE TABLE messages (
 ```sql
 CREATE INDEX idx_sessions_token ON sessions(session_token);
 CREATE INDEX idx_messages_chat_time ON messages(chat_id, created_at);
+CREATE INDEX idx_messages_reply_id ON messages(reply_id);
 CREATE INDEX idx_chats_user_a ON chats(user_a_id);
 CREATE INDEX idx_chats_user_b ON chats(user_b_id);
+CREATE INDEX idx_media_upload_id ON media(upload_id);
+CREATE INDEX idx_media_uploader ON media(uploader_id);
+CREATE INDEX idx_message_media_message ON message_media(message_id);
 ```
 
 ---
@@ -118,6 +171,10 @@ CREATE INDEX idx_chats_user_b ON chats(user_b_id);
 - `/chats` → query `chats`
 - `/chats/{chat_id}` → query `messages`
 - `/chats/{chat_id}/messages` → insert into `messages`
+- `/media/upload` → insert into `media` (write chunk to disk)
+- `/media/{media_id}/meta` → query `media` (chunk metadata)
+- `/media/download/{media_id}` → query `media`, serve file from disk
+- `/chat/{chat_id}/message` (with `media_ids`) → insert into `messages` + `message_media`
 
 ---
 

@@ -26,6 +26,7 @@ class MessageRequest(BaseModel):
     ciphertext: str
     nonce: str
     reply_id: Optional[int] = None
+    media_ids: Optional[list[int]] = None
 
 class LogoutRequest(BaseModel):
     session_id: int
