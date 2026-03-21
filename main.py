@@ -731,13 +731,29 @@ def ws_authenticate(token: str, device_id: str, db: Session) -> User | None:
 async def chat_ws(
     websocket: WebSocket,
     chat_id: int,
-    token: str = Query(...),
-    device_id: str = Query(...),
 ):
+    await websocket.accept()
     db: Session = SessionLocal()
+    user = None
     try:
+        # wait for the first frame which must be an auth message
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+            auth_msg = json.loads(raw)
+        except (asyncio.TimeoutError, Exception):
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        if auth_msg.get("type") != "auth":
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        token = auth_msg.get("token", "")
+        device_id = auth_msg.get("device_id", "")
+
         # authenticate
         user = ws_authenticate(token, device_id, db)
+        token = None  # discard credential
         if not user:
             await websocket.close(code=4001, reason="Unauthorized")
             return
@@ -758,7 +774,12 @@ async def chat_ws(
             await websocket.close(code=4004, reason="Chat not found")
             return
 
-        await manager.connect(chat_id, user.id, websocket)
+        self_conns = manager.active.get(chat_id, {})
+        if user.id in self_conns:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        manager.active.setdefault(chat_id, {})[user.id] = websocket
 
         # send initial history (last 50 messages)
         messages = (
@@ -795,7 +816,6 @@ async def chat_ws(
         while True:
             try:
                 data = await websocket.receive_text()
-                # clients may send {"type":"ping"} to keep alive
                 msg = json.loads(data)
                 if msg.get("type") == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
@@ -804,7 +824,8 @@ async def chat_ws(
             except Exception:
                 break
     finally:
-        manager.disconnect(chat_id, user.id)
+        if user:
+            manager.disconnect(chat_id, user.id)
         db.close()
 
 

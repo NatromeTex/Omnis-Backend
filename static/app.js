@@ -1638,11 +1638,19 @@ function connectChatWebSocket(chatId) {
 
     if (!authToken) return;
 
-    const url = `${WS_BASE}/chat/ws/${chatId}?token=${encodeURIComponent(authToken)}&device_id=${encodeURIComponent(deviceId)}`;
+    // Open a plain WebSocket — no credentials in URL to prevent leakage
+    // through server logs, proxy logs, browser history, and referrer headers.
+    const url = `${WS_BASE}/chat/ws/${chatId}`;
     chatSocket = new WebSocket(url);
 
     chatSocket.addEventListener('open', () => {
-        console.log(`WS connected to chat ${chatId}`);
+        console.log(`WS connected to chat ${chatId}, sending auth frame`);
+        // Authenticate via the first message (server expects this within 10 s)
+        chatSocket.send(JSON.stringify({
+            type: 'auth',
+            token: authToken,
+            device_id: deviceId
+        }));
     });
 
     chatSocket.addEventListener('message', async (event) => {
@@ -1664,10 +1672,13 @@ function connectChatWebSocket(chatId) {
     });
 
     chatSocket.addEventListener('close', (evt) => {
-        console.log(`WS closed (code=${evt.code})`);
+        console.log(`WS closed (code=${evt.code}, reason=${evt.reason})`);
         chatSocket = null;
-        // Reconnect unless we intentionally closed, auth failed (4001), or chat not found (4004)
-        if (evt.code !== 4001 && evt.code !== 4004 && currentChatId === chatId && authToken) {
+        // Do not retry on auth failure (4001), chat not found (4004),
+        // or HTTP 403 handshake rejection.
+        const isUnrecoverable = evt.code === 4001 || evt.code === 4004 ||
+            (evt.reason && evt.reason.includes('403'));
+        if (!isUnrecoverable && currentChatId === chatId && authToken) {
             wsReconnectTimer = setTimeout(() => connectChatWebSocket(chatId), 3000);
         }
     });
