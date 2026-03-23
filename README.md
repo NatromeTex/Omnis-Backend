@@ -18,6 +18,15 @@ For the complete REST API contract, see [endpoints.md](endpoints.md). For client
 
 ## Configuration
 - `SERVER_KEY` environment variable is required for HMAC hashing of session tokens.
+- `FIREBASE_CREDENTIALS_PATH` (optional) points to a Firebase service-account JSON file.
+	If not set, push notifications are disabled but the rest of the API works.
+
+## Real-time Delivery and Push Model
+- Real-time chat delivery is WebSocket-first via `/chat/ws/{chat_id}`.
+- REST fetch (`/chat/fetch/{chat_id}`) is used for scrollback/pagination and reconnect fallback.
+- Android FCM push is used only as a wake signal when recipient devices are not actively connected to that chat WebSocket.
+- Push payloads include wake metadata and generic text only; clients fetch encrypted message data after wake.
+- The backend never includes ciphertext, epoch keys, or private key material in FCM payloads.
 
 ## Files of interest
 - Application entrypoint: [main.py](main.py)

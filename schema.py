@@ -41,3 +41,17 @@ class PublishRequest(BaseModel):
 class PKeyResponse(BaseModel):
     username: str
     identity_pub: str
+
+
+class RegisterFcmTokenRequest(BaseModel):
+    fcm_token: str
+    platform: str = "android"
+
+
+class DeviceFcmTokenResponse(BaseModel):
+    id: int
+    device_id: str
+    platform: str
+    enabled: bool
+    failure_count: int
+    invalid_since: Optional[str] = None

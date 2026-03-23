@@ -4,6 +4,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Boolean,
     Index,
     DateTime,
     ForeignKey,
@@ -76,6 +77,41 @@ class Session(Base):
     expires_at = Column(DateTime, nullable=True)
 
     user = relationship("User")
+
+
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    device_id = Column(String(36), nullable=False)
+    platform = Column(String(16), nullable=False, default="android")
+    fcm_token = Column(Text, nullable=False, unique=True)
+
+    enabled = Column(Boolean, nullable=False, default=True)
+    failure_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(128), nullable=True)
+    invalid_since = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "device_id", "platform"),
+        Index("ix_device_push_tokens_user", "user_id"),
+    )
 
 class ChatEpoch(Base):
     __tablename__ = "chat_epochs"

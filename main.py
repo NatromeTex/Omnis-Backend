@@ -1,10 +1,11 @@
 import asyncio
 import hashlib
 import hmac
+import importlib
 import json
+import logging
 import os
-import uuid
-from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,14 +16,17 @@ from argon2 import PasswordHasher
 from models import Session as SessionModel
 from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta, timezone
-from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest
+from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest, RegisterFcmTokenRequest, DeviceFcmTokenResponse
 import secrets
 
-from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR
+from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR, DevicePushToken
 
 MAX_CHUNK_SIZE = 256 * 1024 * 1024  # 256 MiB
+FCM_PLATFORM_ANDROID = "android"
 
 app = FastAPI()
+
+load_dotenv()
 
 app.mount("/site", StaticFiles(directory="static", html=True), name="site-static")
 app.mount("/app", StaticFiles(directory="static", html=True), name="static")
@@ -36,6 +40,8 @@ app.add_middleware(
 )
 
 ph = PasswordHasher()
+# Use uvicorn's logger so startup push status is visible with --log-level info.
+logger = logging.getLogger("uvicorn.error")
 
 # ── WebSocket connection manager ──────────────────────────────────────
 
@@ -43,17 +49,20 @@ class ConnectionManager:
     """Tracks active WebSocket connections per chat."""
 
     def __init__(self):
-        # chat_id -> dict[user_id, WebSocket]
-        self.active: dict[int, dict[int, WebSocket]] = {}
+        # chat_id -> dict[user_id, dict[device_id, WebSocket]]
+        self.active: dict[int, dict[int, dict[str, WebSocket]]] = {}
 
-    async def connect(self, chat_id: int, user_id: int, ws: WebSocket):
-        await ws.accept()
-        self.active.setdefault(chat_id, {})[user_id] = ws
+    async def connect(self, chat_id: int, user_id: int, device_id: str, ws: WebSocket):
+        self.active.setdefault(chat_id, {}).setdefault(user_id, {})[device_id] = ws
 
-    def disconnect(self, chat_id: int, user_id: int):
+    def disconnect(self, chat_id: int, user_id: int, device_id: str):
         chat_conns = self.active.get(chat_id)
         if chat_conns:
-            chat_conns.pop(user_id, None)
+            user_conns = chat_conns.get(user_id)
+            if user_conns:
+                user_conns.pop(device_id, None)
+                if not user_conns:
+                    chat_conns.pop(user_id, None)
             if not chat_conns:
                 del self.active[chat_id]
 
@@ -63,24 +72,266 @@ class ConnectionManager:
         if not chat_conns:
             return
         data = json.dumps(payload)
-        stale: list[int] = []
-        for uid, ws in chat_conns.items():
+        stale: list[tuple[int, str]] = []
+        for uid, device_conns in chat_conns.items():
             if uid == exclude_user_id:
                 continue
-            try:
-                await ws.send_text(data)
-            except Exception:
-                stale.append(uid)
-        for uid in stale:
-            chat_conns.pop(uid, None)
+            for device_id, ws in device_conns.items():
+                try:
+                    await ws.send_text(data)
+                except Exception:
+                    stale.append((uid, device_id))
+        for uid, device_id in stale:
+            self.disconnect(chat_id, uid, device_id)
+
+    def active_device_ids(self, chat_id: int, user_id: int) -> set[str]:
+        chat_conns = self.active.get(chat_id, {})
+        return set(chat_conns.get(user_id, {}).keys())
 
 manager = ConnectionManager()
+
+
+class FcmNotifier:
+    def __init__(self):
+        self.enabled = False
+        self.firebase_admin = None
+        self.credentials = None
+        self.messaging = None
+
+    def initialize(self):
+        try:
+            self.firebase_admin = importlib.import_module("firebase_admin")
+            self.credentials = importlib.import_module("firebase_admin.credentials")
+            self.messaging = importlib.import_module("firebase_admin.messaging")
+        except Exception:
+            logger.warning("Firebase Admin SDK not available; push notifications are disabled")
+            return
+
+        credentials_path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
+        if not credentials_path:
+            logger.warning("FIREBASE_CREDENTIALS_PATH not set; push notifications are disabled")
+            return
+
+        if not os.path.exists(credentials_path):
+            logger.warning("Firebase credentials file not found at configured path")
+            return
+
+        try:
+            if not self.firebase_admin._apps:
+                cred = self.credentials.Certificate(credentials_path)
+                self.firebase_admin.initialize_app(cred)
+            self.enabled = True
+            logger.info("Firebase push notifications enabled")
+        except Exception as exc:
+            logger.warning("Failed to initialize Firebase Admin SDK: %s", exc)
+
+    @staticmethod
+    def _is_invalid_token_error(exc: Exception) -> bool:
+        value = str(exc).lower()
+        return (
+            "unregistered" in value
+            or "registration-token-not-registered" in value
+            or "invalid registration token" in value
+            or "invalid argument" in value
+        )
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        if len(token) <= 12:
+            return "***"
+        return f"{token[:6]}...{token[-6:]}"
+
+    async def send_wake(
+        self,
+        fcm_tokens: list[str],
+        sender_id: int,
+        chat_id: int,
+        created_at: str,
+    ) -> dict[str, set[str]]:
+        result = {
+            "ok": set(),
+            "failed": set(),
+            "invalid": set(),
+        }
+        if not self.enabled or self.messaging is None:
+            logger.info(
+                "FCM wake skipped: notifier disabled or Firebase messaging unavailable (chat_id=%s sender_id=%s tokens=%s)",
+                chat_id,
+                sender_id,
+                len(fcm_tokens),
+            )
+            return result
+
+        data_payload = {
+            "event": "chat_wake",
+            "chat_id": str(chat_id),
+            "sender_id": str(sender_id),
+            "created_at": created_at,
+            "body": "New message",
+        }
+
+        def _send_all() -> dict[str, set[str]]:
+            local_result = {
+                "ok": set(),
+                "failed": set(),
+                "invalid": set(),
+            }
+
+            logger.info(
+                "FCM wake dispatch started (chat_id=%s sender_id=%s tokens=%s)",
+                chat_id,
+                sender_id,
+                len(fcm_tokens),
+            )
+            for token in fcm_tokens:
+                msg = self.messaging.Message(
+                    token=token,
+                    data=data_payload,
+                    android=self.messaging.AndroidConfig(priority="high"),
+                )
+                try:
+                    fcm_message_id = self.messaging.send(msg)
+                    local_result["ok"].add(token)
+                    logger.info(
+                        "FCM wake sent (chat_id=%s sender_id=%s token=%s message_id=%s)",
+                        chat_id,
+                        sender_id,
+                        self._mask_token(token),
+                        fcm_message_id,
+                    )
+                except Exception as exc:
+                    if self._is_invalid_token_error(exc):
+                        local_result["invalid"].add(token)
+                        logger.warning(
+                            "FCM wake invalid token (chat_id=%s sender_id=%s token=%s error=%s)",
+                            chat_id,
+                            sender_id,
+                            self._mask_token(token),
+                            exc,
+                        )
+                    else:
+                        local_result["failed"].add(token)
+                        logger.error(
+                            "FCM wake send failed (chat_id=%s sender_id=%s token=%s error=%s)",
+                            chat_id,
+                            sender_id,
+                            self._mask_token(token),
+                            exc,
+                        )
+
+            logger.info(
+                "FCM wake dispatch completed (chat_id=%s sender_id=%s ok=%s failed=%s invalid=%s)",
+                chat_id,
+                sender_id,
+                len(local_result["ok"]),
+                len(local_result["failed"]),
+                len(local_result["invalid"]),
+            )
+            return local_result
+
+        return await asyncio.to_thread(_send_all)
+
+
+fcm_notifier = FcmNotifier()
+
+
+async def notify_chat_wake(
+    chat_id: int,
+    recipient_user_id: int,
+    sender_id: int,
+    created_at: datetime,
+):
+    if not fcm_notifier.enabled:
+        logger.info(
+            "FCM wake not attempted: notifier disabled (chat_id=%s sender_id=%s recipient_user_id=%s)",
+            chat_id,
+            sender_id,
+            recipient_user_id,
+        )
+        return
+
+    db: Session = SessionLocal()
+    try:
+        excluded_device_ids = manager.active_device_ids(chat_id, recipient_user_id)
+        tokens_query = (
+            db.query(DevicePushToken)
+            .filter(
+                DevicePushToken.user_id == recipient_user_id,
+                DevicePushToken.platform == FCM_PLATFORM_ANDROID,
+                DevicePushToken.enabled == True,
+            )
+        )
+
+        if excluded_device_ids:
+            tokens_query = tokens_query.filter(~DevicePushToken.device_id.in_(excluded_device_ids))
+
+        token_rows = tokens_query.all()
+        if not token_rows:
+            logger.info(
+                "FCM wake skipped: no eligible recipient tokens (chat_id=%s sender_id=%s recipient_user_id=%s excluded_devices=%s)",
+                chat_id,
+                sender_id,
+                recipient_user_id,
+                len(excluded_device_ids),
+            )
+            return
+
+        fcm_tokens = [row.fcm_token for row in token_rows]
+    finally:
+        db.close()
+
+    push_result = await fcm_notifier.send_wake(
+        fcm_tokens=fcm_tokens,
+        sender_id=sender_id,
+        chat_id=chat_id,
+        created_at=created_at.isoformat(),
+    )
+
+    logger.info(
+        "FCM wake result (chat_id=%s sender_id=%s recipient_user_id=%s attempted=%s ok=%s failed=%s invalid=%s)",
+        chat_id,
+        sender_id,
+        recipient_user_id,
+        len(fcm_tokens),
+        len(push_result["ok"]),
+        len(push_result["failed"]),
+        len(push_result["invalid"]),
+    )
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        rows = (
+            db.query(DevicePushToken)
+            .filter(DevicePushToken.fcm_token.in_(fcm_tokens))
+            .all()
+        )
+        for row in rows:
+            if row.fcm_token in push_result["invalid"]:
+                row.enabled = False
+                row.invalid_since = now
+                row.failure_count += 1
+                row.last_error = "invalid-token"
+            elif row.fcm_token in push_result["failed"]:
+                row.failure_count += 1
+                row.last_error = "send-failed"
+            elif row.fcm_token in push_result["ok"]:
+                row.last_success_at = now
+                row.last_error = None
+                row.failure_count = 0
+
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 # ── Startup ───────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
     init_db()
+    fcm_notifier.initialize()
 
 def get_db():
     db = SessionLocal()
@@ -144,7 +395,7 @@ async def site_root():
 
 @app.get("/version")
 async def get_version():
-    return {"version": "50"}
+    return {"version": "60"}
 
 # Authentication endpoints
 @app.post("/auth/signup", status_code=201)
@@ -256,6 +507,24 @@ async def logout(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    now = datetime.now(timezone.utc)
+    (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user.id,
+            DevicePushToken.device_id == device_Id,
+            DevicePushToken.enabled == True,
+        )
+        .update(
+            {
+                DevicePushToken.enabled: False,
+                DevicePushToken.invalid_since: now,
+                DevicePushToken.last_error: "logged-out",
+            },
+            synchronize_session=False,
+        )
+    )
+
     db.delete(session)
     db.commit()
 
@@ -352,6 +621,127 @@ async def search_users(
     )
 
     return [{"id": u.id, "username": u.username} for u in matches]
+
+
+@app.post("/device/fcm/register", response_model=DeviceFcmTokenResponse)
+async def register_device_fcm_token(
+    payload: RegisterFcmTokenRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+    device_id: str = Header(..., alias="X-Device-ID"),
+):
+    platform = payload.platform.lower().strip()
+    if platform != FCM_PLATFORM_ANDROID:
+        raise HTTPException(status_code=400, detail="Only android is supported")
+
+    token_value = payload.fcm_token.strip()
+    if not token_value:
+        raise HTTPException(status_code=400, detail="fcm_token is required")
+
+    row = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user.id,
+            DevicePushToken.device_id == device_id,
+            DevicePushToken.platform == platform,
+        )
+        .one_or_none()
+    )
+
+    if not row:
+        row = (
+            db.query(DevicePushToken)
+            .filter(DevicePushToken.fcm_token == token_value)
+            .one_or_none()
+        )
+
+    if not row:
+        row = DevicePushToken(
+            user_id=user.id,
+            device_id=device_id,
+            platform=platform,
+            fcm_token=token_value,
+            enabled=True,
+            failure_count=0,
+        )
+        db.add(row)
+    else:
+        row.user_id = user.id
+        row.device_id = device_id
+        row.platform = platform
+        row.fcm_token = token_value
+        row.enabled = True
+        row.failure_count = 0
+        row.last_error = None
+        row.invalid_since = None
+
+    db.commit()
+    db.refresh(row)
+
+    return {
+        "id": row.id,
+        "device_id": row.device_id,
+        "platform": row.platform,
+        "enabled": row.enabled,
+        "failure_count": row.failure_count,
+        "invalid_since": row.invalid_since.isoformat() if row.invalid_since else None,
+    }
+
+
+@app.delete("/device/fcm/current")
+async def disable_current_device_fcm_token(
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+    device_id: str = Header(..., alias="X-Device-ID"),
+):
+    now = datetime.now(timezone.utc)
+    updated = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user.id,
+            DevicePushToken.device_id == device_id,
+            DevicePushToken.platform == FCM_PLATFORM_ANDROID,
+            DevicePushToken.enabled == True,
+        )
+        .update(
+            {
+                DevicePushToken.enabled: False,
+                DevicePushToken.invalid_since: now,
+                DevicePushToken.last_error: "disabled-by-user",
+            },
+            synchronize_session=False,
+        )
+    )
+
+    db.commit()
+    return {"status": "disabled", "updated": updated}
+
+
+@app.get("/device/fcm/tokens", response_model=list[DeviceFcmTokenResponse])
+async def list_device_fcm_tokens(
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user.id,
+            DevicePushToken.platform == FCM_PLATFORM_ANDROID,
+        )
+        .order_by(desc(DevicePushToken.updated_at))
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "device_id": row.device_id,
+            "platform": row.platform,
+            "enabled": row.enabled,
+            "failure_count": row.failure_count,
+            "invalid_since": row.invalid_since.isoformat() if row.invalid_since else None,
+        }
+        for row in rows
+    ]
 
 
 @app.delete("/users/sessions/revoke/{session_id}")
@@ -735,6 +1125,7 @@ async def chat_ws(
     await websocket.accept()
     db: Session = SessionLocal()
     user = None
+    ws_device_id: str | None = None
     try:
         # wait for the first frame which must be an auth message
         try:
@@ -750,6 +1141,7 @@ async def chat_ws(
 
         token = auth_msg.get("token", "")
         device_id = auth_msg.get("device_id", "")
+        ws_device_id = device_id
 
         # authenticate
         user = ws_authenticate(token, device_id, db)
@@ -775,11 +1167,11 @@ async def chat_ws(
             return
 
         self_conns = manager.active.get(chat_id, {})
-        if user.id in self_conns:
+        if device_id in self_conns.get(user.id, {}):
             await websocket.close(code=4001, reason="Unauthorized")
             return
 
-        manager.active.setdefault(chat_id, {})[user.id] = websocket
+        await manager.connect(chat_id, user.id, device_id, websocket)
 
         # send initial history (last 50 messages)
         messages = (
@@ -824,8 +1216,8 @@ async def chat_ws(
             except Exception:
                 break
     finally:
-        if user:
-            manager.disconnect(chat_id, user.id)
+        if user and ws_device_id:
+            manager.disconnect(chat_id, user.id, ws_device_id)
         db.close()
 
 
@@ -1228,6 +1620,15 @@ async def message(
         },
     }
     asyncio.ensure_future(manager.broadcast(chat_id, ws_payload))
+    recipient_user_id = chat.user_b_id if chat.user_a_id == user.id else chat.user_a_id
+    asyncio.ensure_future(
+        notify_chat_wake(
+            chat_id=chat_id,
+            recipient_user_id=recipient_user_id,
+            sender_id=user.id,
+            created_at=msg.created_at,
+        )
+    )
 
     return {
         "id": msg.id,
