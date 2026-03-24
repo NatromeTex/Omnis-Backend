@@ -4,6 +4,7 @@ import hmac
 import importlib
 import json
 import logging
+import uuid
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
@@ -885,6 +886,10 @@ async def upload_media(
         )
         .one_or_none()
     )
+
+    #validate upload_id
+    if not uuid.UUID(upload_id, version=4):
+        raise HTTPException(status_code=400, detail="Invalid upload_id")
 
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
