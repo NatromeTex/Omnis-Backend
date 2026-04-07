@@ -4,6 +4,7 @@ import hmac
 import importlib
 import json
 import logging
+import re
 import uuid
 import os
 from collections import deque
@@ -40,6 +41,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_MEDIA_UPLOAD_MAX_BODY = 256 * 1024 * 1024  # 256 MiB — matches chunk limit
+_DEFAULT_MAX_BODY = 1 * 1024 * 1024          # 1 MiB for all other endpoints
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    limit = _MEDIA_UPLOAD_MAX_BODY if request.url.path == "/media/upload" else _DEFAULT_MAX_BODY
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > limit:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "Request body too large"}, status_code=413)
+        except ValueError:
+            pass
+    return await call_next(request)
 
 ph = PasswordHasher()
 # Use uvicorn's logger so startup push status is visible with --log-level info.
@@ -279,36 +296,27 @@ async def notify_chat_wake(
             return
 
         fcm_tokens = [row.fcm_token for row in token_rows]
-    finally:
-        db.close()
 
-    push_result = await fcm_notifier.send_wake(
-        fcm_tokens=fcm_tokens,
-        sender_id=sender_id,
-        chat_id=chat_id,
-        created_at=created_at.isoformat(),
-    )
-
-    logger.info(
-        "FCM wake result (chat_id=%s sender_id=%s recipient_user_id=%s attempted=%s ok=%s failed=%s invalid=%s)",
-        chat_id,
-        sender_id,
-        recipient_user_id,
-        len(fcm_tokens),
-        len(push_result["ok"]),
-        len(push_result["failed"]),
-        len(push_result["invalid"]),
-    )
-
-    db = SessionLocal()
-    try:
-        now = datetime.now(timezone.utc)
-        rows = (
-            db.query(DevicePushToken)
-            .filter(DevicePushToken.fcm_token.in_(fcm_tokens))
-            .all()
+        push_result = await fcm_notifier.send_wake(
+            fcm_tokens=fcm_tokens,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            created_at=created_at.isoformat(),
         )
-        for row in rows:
+
+        logger.info(
+            "FCM wake result (chat_id=%s sender_id=%s recipient_user_id=%s attempted=%s ok=%s failed=%s invalid=%s)",
+            chat_id,
+            sender_id,
+            recipient_user_id,
+            len(fcm_tokens),
+            len(push_result["ok"]),
+            len(push_result["failed"]),
+            len(push_result["invalid"]),
+        )
+
+        now = datetime.now(timezone.utc)
+        for row in token_rows:
             if row.fcm_token in push_result["invalid"]:
                 row.enabled = False
                 row.invalid_since = now
@@ -360,6 +368,12 @@ def is_valid_uuid4(value: str) -> bool:
     except (ValueError, AttributeError):
         return False
 
+_NONCE_RE = re.compile(r'^[A-Za-z0-9+/=_-]{16,48}$')
+
+def is_valid_nonce(value: str) -> bool:
+    """Return True iff value looks like a valid AES-GCM nonce (base64/hex, 16-48 chars)."""
+    return bool(_NONCE_RE.match(value))
+
 # ── Login rate-limiting state ─────────────────────────────────────────
 # Maps IP -> list of failed-attempt datetimes (cleared on ban)
 _login_attempts: dict[str, list] = {}
@@ -406,6 +420,9 @@ async def require_auth(
 
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    session.last_accessed = datetime.now(timezone.utc)
+    db.commit()
 
     return user
 
@@ -655,7 +672,7 @@ async def list_sessions(
 
 @app.get("/users/search")
 async def search_users(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=3),
     user: User = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -898,7 +915,7 @@ async def get_public_key(
     )
 
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Public key not found")
 
     user_key = (
         db.query(UserKey)
@@ -907,10 +924,7 @@ async def get_public_key(
     )
 
     if not user_key:
-        raise HTTPException(
-            status_code=404,
-            detail="User has not published a public key",
-        )
+        raise HTTPException(status_code=404, detail="Public key not found")
 
     return {
         "username": user.username,
@@ -984,6 +998,9 @@ async def upload_media(
     if file_size == 0:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    if not is_valid_nonce(nonce):
+        raise HTTPException(status_code=400, detail="Invalid nonce")
+
     # check for duplicate chunk
     existing_chunk = (
         db.query(Media)
@@ -996,6 +1013,18 @@ async def upload_media(
 
     if existing_chunk:
         raise HTTPException(status_code=409, detail="Chunk already uploaded")
+
+    # Enforce total_chunks immutability: the first uploaded chunk locks the value
+    prior_chunk = (
+        db.query(Media)
+        .filter(Media.upload_id == upload_id)
+        .first()
+    )
+    if prior_chunk and prior_chunk.total_chunks != total_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="total_chunks does not match the value used for previous chunks of this upload",
+        )
 
     # store on disk: uploads/<chat_id>/<upload_id>_<chunk_index>
     chat_dir = os.path.join(UPLOAD_DIR, str(chat_id))
@@ -1444,7 +1473,7 @@ async def fetch_epoch(
         .one_or_none()
     )
 
-    if not epoch:
+    if not epoch or not epoch.wrapped_key_a or not epoch.wrapped_key_b:
         raise HTTPException(status_code=404, detail="Epoch not found")
 
     is_user_a = chat.user_a_id == user.id
@@ -1632,6 +1661,9 @@ async def message(
             status_code=409,
             detail="Epoch not initialized",
         )
+
+    if not is_valid_nonce(payload.nonce):
+        raise HTTPException(status_code=400, detail="Invalid nonce")
 
     if payload.reply_id is not None:
         replied = (

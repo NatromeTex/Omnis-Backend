@@ -1,9 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 class SignupRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=5, max_length=32)
+    password: str = Field(..., min_length=6)
 
     identity_pub: str
     encrypted_identity_priv: str
@@ -11,8 +11,8 @@ class SignupRequest(BaseModel):
     aead_nonce: str
 
 class AuthRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=5, max_length=32)
+    password: str = Field(..., min_length=6)
 
 class ChatRequest(BaseModel):
     username: str
