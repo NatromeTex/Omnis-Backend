@@ -6,8 +6,9 @@ import json
 import logging
 import uuid
 import os
+from collections import deque
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse
@@ -341,10 +342,29 @@ def get_db():
     finally:
         db.close()
 
+_raw_key = os.environ.get("SERVER_KEY", "")
+if not _raw_key:
+    raise RuntimeError("SERVER_KEY environment variable is not set")
 try:
-    SERVER_KEY = os.environ.get("SERVER_KEY").encode("utf-8")
-except Exception:
-    raise RuntimeError("SERVER_KEY environment variable must be set")
+    SERVER_KEY = bytes.fromhex(_raw_key)
+except ValueError:
+    raise RuntimeError("SERVER_KEY must be a valid hex string")
+if len(SERVER_KEY) < 32:
+    raise RuntimeError("SERVER_KEY must be at least 32 bytes (64 hex characters)")
+
+def is_valid_uuid4(value: str) -> bool:
+    """Return True iff value is a canonical lowercase UUID v4 string."""
+    try:
+        val = uuid.UUID(value, version=4)
+        return str(val) == value.lower()
+    except (ValueError, AttributeError):
+        return False
+
+# ── Login rate-limiting state ─────────────────────────────────────────
+# Maps IP -> list of failed-attempt datetimes (cleared on ban)
+_login_attempts: dict[str, list] = {}
+# Maps IP -> ban-expiry datetime
+_ip_bans: dict[str, datetime] = {}
 
 async def require_auth(
     authorization: str = Header(...),
@@ -353,6 +373,9 @@ async def require_auth(
 ) -> User:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    if not is_valid_uuid4(device_Id):
+        raise HTTPException(status_code=401, detail="Invalid device ID")
 
     token = authorization.removeprefix("Bearer ").strip()
     token_hash = hmac.new(
@@ -396,7 +419,7 @@ async def site_root():
 
 @app.get("/version")
 async def get_version():
-    return {"version": "60"}
+    return {"version": "75"}
 
 # Authentication endpoints
 @app.post("/auth/signup", status_code=201)
@@ -440,24 +463,47 @@ async def signup(payload: SignupRequest, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 async def login(
-    payload: AuthRequest, 
+    request: Request,
+    payload: AuthRequest,
     db: Session = Depends(get_db),
     device_Id: str = Header(..., alias="X-Device-ID"),
     user_Agent: str | None = Header(None),
 ):
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Check IP ban
+    ban_expiry = _ip_bans.get(client_ip)
+    if ban_expiry and ban_expiry > datetime.now(timezone.utc):
+        raise HTTPException(status_code=429, detail="Too many failed attempts, try again later")
+
+    if not is_valid_uuid4(device_Id):
+        raise HTTPException(status_code=401, detail="Invalid device ID")
+
     user = (
         db.query(User)
         .filter(User.username == payload.username)
         .one_or_none()
     )
 
+    def _record_failure():
+        attempts = _login_attempts.setdefault(client_ip, [])
+        attempts.append(datetime.now(timezone.utc))
+        if len(attempts) >= 3:
+            _ip_bans[client_ip] = datetime.now(timezone.utc) + timedelta(hours=2)
+            _login_attempts.pop(client_ip, None)
+
     if not user:
+        _record_failure()
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     try:
         ph.verify(user.password_hash, payload.password)
     except VerifyMismatchError:
+        _record_failure()
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # Clear any prior failed attempts on success
+    _login_attempts.pop(client_ip, None)
 
     token = secrets.token_urlsafe(32)
 
@@ -466,6 +512,17 @@ async def login(
         token.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+    # LRU session pruning: keep at most 9 existing sessions so the new one makes 10
+    existing_sessions = (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == user.id)
+        .order_by(SessionModel.last_accessed.asc())
+        .all()
+    )
+    if len(existing_sessions) >= 10:
+        for old in existing_sessions[: len(existing_sessions) - 9]:
+            db.delete(old)
 
     session = SessionModel(
         user_id=user.id,
@@ -894,16 +951,29 @@ async def upload_media(
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
+    # Enforce 25 GiB per-user storage quota
+    MAX_USER_STORAGE = 25 * 1024 * 1024 * 1024  # 25 GiB in bytes
+    used_bytes = (
+        db.query(func.coalesce(func.sum(Media.file_size), 0))
+        .filter(Media.uploader_id == user.id)
+        .scalar()
+    )
+    # Read file size before full read for quota check; re-read below
+    content = await file.read()
+    file_size = len(content)
+
+    if used_bytes + file_size > MAX_USER_STORAGE:
+        raise HTTPException(
+            status_code=413,
+            detail="Storage quota exceeded (25 GiB per user)",
+        )
+
     # validate chunk parameters
     if chunk_index < 0 or chunk_index >= total_chunks:
         raise HTTPException(status_code=400, detail="Invalid chunk_index")
 
     if total_chunks < 1:
         raise HTTPException(status_code=400, detail="total_chunks must be >= 1")
-
-    # read file content and enforce 256 MiB chunk limit
-    content = await file.read()
-    file_size = len(content)
 
     if file_size > MAX_CHUNK_SIZE:
         raise HTTPException(
@@ -1120,35 +1190,24 @@ def ws_authenticate(token: str, device_id: str, db: Session) -> User | None:
     return db.query(User).filter(User.id == session.user_id).one_or_none()
 
 
-# ── WebSocket endpoint ───────────────────────────────────────────────
+# Per-user WebSocket message timestamps for rate limiting (user_id -> deque of datetimes)
+_ws_msg_times: dict[int, deque] = {}
 
 @app.websocket("/chat/ws/{chat_id}")
 async def chat_ws(
     websocket: WebSocket,
     chat_id: int,
+    token: str = Query(...),
+    device_id: str = Query(...),
 ):
-    await websocket.accept()
     db: Session = SessionLocal()
     user = None
-    ws_device_id: str | None = None
     try:
-        # wait for the first frame which must be an auth message
-        try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10)
-            auth_msg = json.loads(raw)
-        except (asyncio.TimeoutError, Exception):
+        # ── Authenticate BEFORE accepting the connection ───────────────
+        if not is_valid_uuid4(device_id):
             await websocket.close(code=4001, reason="Unauthorized")
             return
 
-        if auth_msg.get("type") != "auth":
-            await websocket.close(code=4001, reason="Unauthorized")
-            return
-
-        token = auth_msg.get("token", "")
-        device_id = auth_msg.get("device_id", "")
-        ws_device_id = device_id
-
-        # authenticate
         user = ws_authenticate(token, device_id, db)
         token = None  # discard credential
         if not user:
@@ -1171,11 +1230,14 @@ async def chat_ws(
             await websocket.close(code=4004, reason="Chat not found")
             return
 
+        # Reject duplicate device connection to same chat
         self_conns = manager.active.get(chat_id, {})
         if device_id in self_conns.get(user.id, {}):
             await websocket.close(code=4001, reason="Unauthorized")
             return
 
+        # ── Accept only after auth passes ─────────────────────────────
+        await websocket.accept()
         await manager.connect(chat_id, user.id, device_id, websocket)
 
         # send initial history (last 50 messages)
@@ -1210,20 +1272,47 @@ async def chat_ws(
             "next_cursor": next_cursor,
         }))
 
-        # keep connection alive – listen for client pings / close
+        # ── Main receive loop ──────────────────────────────────────────
         while True:
             try:
                 data = await websocket.receive_text()
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    await websocket.send_text(json.dumps({"type": "pong"}))
             except WebSocketDisconnect:
                 break
             except Exception:
                 break
+
+            # Enforce max message size
+            if len(data) > 16384:
+                await websocket.close(code=1009, reason="Message too large")
+                break
+
+            # Enforce 3 messages/second/user rate limit
+            now = datetime.now(timezone.utc)
+            times = _ws_msg_times.setdefault(user.id, deque())
+            while times and (now - times[0]).total_seconds() > 1.0:
+                times.popleft()
+            if len(times) >= 3:
+                await websocket.close(code=4029, reason="Rate limit exceeded")
+                break
+            times.append(now)
+
+            try:
+                msg = json.loads(data)
+            except Exception:
+                continue
+
+            if msg.get("type") == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+
     finally:
-        if user and ws_device_id:
-            manager.disconnect(chat_id, user.id, ws_device_id)
+        if user is not None:
+            manager.disconnect(chat_id, user.id, device_id)
+            # Clean up rate-limit state for this user if no more WS connections
+            if not any(
+                user.id in conns
+                for conns in manager.active.values()
+            ):
+                _ws_msg_times.pop(user.id, None)
         db.close()
 
 
@@ -1544,6 +1633,21 @@ async def message(
             detail="Epoch not initialized",
         )
 
+    if payload.reply_id is not None:
+        replied = (
+            db.query(Message)
+            .filter(
+                Message.id == payload.reply_id,
+                Message.chat_id == chat_id,
+            )
+            .one_or_none()
+        )
+        if not replied:
+            raise HTTPException(
+                status_code=404,
+                detail="Reply target not found in this chat",
+            )
+
     msg = Message(
         chat_id=chat.id,
         sender_id=user.id,
@@ -1573,6 +1677,13 @@ async def message(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Media {mid} not found or does not belong to this chat",
+                )
+
+            if media.uploader_id != user.id:
+                db.rollback()
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Media {mid} was not uploaded by you",
                 )
 
             # ensure all chunks are uploaded
