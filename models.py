@@ -224,7 +224,10 @@ class Message(Base):
     epoch_id = Column(Integer, ForeignKey("chat_epochs.id"))
     ciphertext = Column(Text, nullable=False)
     nonce = Column(String(48), nullable=False)
-    
+
+    is_deleted = Column(Boolean, nullable=False, default=False)
+    deleted_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     __table_args__ = (

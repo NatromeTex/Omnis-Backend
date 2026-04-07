@@ -612,6 +612,7 @@ If the timeout elapses with no message the connection is also closed with
       "reply_id": 1000,
       "ciphertext": "base64-or-opaque-string",
       "nonce": "string",
+      "deleted": false,
       "created_at": "ISO-8601",
       "attachments": [
         {
@@ -646,9 +647,18 @@ If the timeout elapses with no message the connection is also closed with
     "reply_id": null,
     "ciphertext": "base64-or-opaque-string",
     "nonce": "string",
+    "deleted": false,
     "created_at": "ISO-8601",
     "attachments": []
   }
+}
+```
+
+*message_deleted* (pushed when a message is soft-deleted)
+```json
+{
+  "type": "message_deleted",
+  "message_id": 1001
 }
 ```
 
@@ -717,6 +727,7 @@ limit: integer (optional, default 50, max 100)
       "reply_id": 1000,
       "ciphertext": "base64-or-opaque-string",
       "nonce": "string",
+      "deleted": false,
       "created_at": "ISO-8601",
       "attachments": [
         {
@@ -745,6 +756,9 @@ limit: integer (optional, default 50, max 100)
   as `before_id` in the next request.
 - Each message contains an `epoch_id` field. Use `GET /chat/{chat_id}/{epoch_id}/fetch`
   to retrieve the wrapped epoch key needed for decryption.
+- When `deleted` is `true`, the message has been soft-deleted by its sender.
+  `ciphertext` and `nonce` will be empty strings; the client should render a
+  placeholder (e.g. "This message was deleted") instead of attempting to decrypt.
 
 Errors:
 - `401` — unauthorized
@@ -891,6 +905,41 @@ Errors:
 - `409` — epoch not initialized (wrapped keys missing)
 - `400` — referenced media not found or does not belong to this chat
 - `400` — upload incomplete (not all chunks uploaded)
+
+---
+
+### DELETE /chat/{chat_id}/message/{message_id}
+
+Soft-deletes a message. Only the original sender may delete their own message.
+The message row is retained (reply threads remain intact), but `ciphertext` and
+`nonce` are replaced with empty strings in all future fetch responses and the
+`deleted` flag is set to `true`. Connected WebSocket clients receive a
+`message_deleted` frame immediately.
+
+**Headers**
+```
+Authorization: Bearer <token>
+X-Device-ID: <uuid-v4>
+```
+
+**Path parameters**
+- `chat_id` — integer
+- `message_id` — integer
+
+**Response — 200 OK**
+```json
+{
+  "status": "deleted",
+  "message_id": 1001
+}
+```
+
+Errors:
+- `401` — unauthorized
+- `403` — message belongs to another user
+- `404` — chat not found or user is not a member
+- `404` — message not found
+- `409` — message already deleted
 
 ---
 

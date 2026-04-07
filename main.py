@@ -1194,8 +1194,9 @@ async def chat_ws(
                 "sender_id": m.sender_id,
                 "epoch_id": m.epoch_id,
                 "reply_id": m.reply_id,
-                "ciphertext": m.ciphertext,
-                "nonce": m.nonce,
+                "ciphertext": "" if m.is_deleted else m.ciphertext,
+                "nonce": "" if m.is_deleted else m.nonce,
+                "deleted": m.is_deleted,
                 "created_at": m.created_at.isoformat(),
                 "attachments": _attachments_for_message(m.id, db),
             }
@@ -1306,8 +1307,9 @@ async def fetch_chat(
             "sender_id": m.sender_id,
             "epoch_id": m.epoch_id,
             "reply_id": m.reply_id,
-            "ciphertext": m.ciphertext,
-            "nonce": m.nonce,
+            "ciphertext": "" if m.is_deleted else m.ciphertext,
+            "nonce": "" if m.is_deleted else m.nonce,
+            "deleted": m.is_deleted,
             "created_at": m.created_at,
             "attachments": _attachments_for_message(m.id, db),
         }
@@ -1620,6 +1622,7 @@ async def message(
             "reply_id": msg.reply_id,
             "ciphertext": msg.ciphertext,
             "nonce": msg.nonce,
+            "deleted": False,
             "created_at": msg.created_at.isoformat(),
             "attachments": attachments,
         },
@@ -1641,3 +1644,55 @@ async def message(
         "created_at": msg.created_at,
         "attachments": attachments,
     }
+
+
+@app.delete("/chat/{chat_id}/message/{message_id}", status_code=200)
+async def delete_message(
+    chat_id: int,
+    message_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == chat_id,
+            or_(
+                Chat.user_a_id == user.id,
+                Chat.user_b_id == user.id,
+            ),
+        )
+        .one_or_none()
+    )
+
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    msg = (
+        db.query(Message)
+        .filter(
+            Message.id == message_id,
+            Message.chat_id == chat_id,
+        )
+        .one_or_none()
+    )
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if msg.sender_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+    if msg.is_deleted:
+        raise HTTPException(status_code=409, detail="Message already deleted")
+
+    msg.is_deleted = True
+    msg.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+
+    asyncio.ensure_future(manager.broadcast(chat_id, {
+        "type": "message_deleted",
+        "message_id": message_id,
+    }))
+
+    return {"status": "deleted", "message_id": message_id}

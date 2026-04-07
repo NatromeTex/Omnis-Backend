@@ -148,6 +148,12 @@ The server **never sees plaintext messages or identity private keys**. It only s
   - Use the latest epoch key to AES‑GCM encrypt the UTF‑8 message body.
   - Post ciphertext, nonce, and epoch id via `/chat/{chat_id}/message`.
   - If the send fails due to stale or unknown epoch, refresh epoch state and retry once.
+- **Deleted messages**: Each message object includes a `deleted` boolean field.
+  - When `deleted` is `true`, `ciphertext` and `nonce` are empty strings — do **not** attempt decryption.
+  - Render a placeholder such as *"This message was deleted"* in place of the message body.
+  - Attachments are still listed in the `attachments` array but should not be shown.
+  - To delete a message, call `DELETE /chat/{chat_id}/message/{message_id}`. Only the sender of a message may delete it (the server enforces this with a `403`).
+  - On receiving a `message_deleted` WebSocket frame (`{"type":"message_deleted","message_id":…}`), find the matching message in the local store and mark it as deleted (clear ciphertext/nonce, set `deleted = true`) so the UI updates in real time without a refetch.
 
 ### 3.5 Media Attachments
 
