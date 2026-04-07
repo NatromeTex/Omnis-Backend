@@ -21,6 +21,7 @@ from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta, timezone
 from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest, RegisterFcmTokenRequest, DeviceFcmTokenResponse
 import secrets
+import rjsmin
 
 from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR, DevicePushToken
 
@@ -342,6 +343,15 @@ async def notify_chat_wake(
 def startup():
     init_db()
     fcm_notifier.initialize()
+    _minify_js()
+
+def _minify_js():
+    src = os.path.join("static", "app.js")
+    dst = os.path.join("static", "app.min.js")
+    with open(src) as f:
+        minified = rjsmin.jsmin(f.read())
+    with open(dst, "w") as f:
+        f.write(minified)
 
 def get_db():
     db = SessionLocal()
@@ -353,12 +363,9 @@ def get_db():
 _raw_key = os.environ.get("SERVER_KEY", "")
 if not _raw_key:
     raise RuntimeError("SERVER_KEY environment variable is not set")
-try:
-    SERVER_KEY = bytes.fromhex(_raw_key)
-except ValueError:
-    raise RuntimeError("SERVER_KEY must be a valid hex string")
-if len(SERVER_KEY) < 32:
-    raise RuntimeError("SERVER_KEY must be at least 32 bytes (64 hex characters)")
+SERVER_KEY = _raw_key.encode()
+if len(SERVER_KEY) < 10:
+    raise RuntimeError("SERVER_KEY must be at least 10 characters")
 
 def is_valid_uuid4(value: str) -> bool:
     """Return True iff value is a canonical lowercase UUID v4 string."""

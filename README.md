@@ -37,3 +37,8 @@ For the complete REST API contract, see [endpoints.md](endpoints.md). For client
 
 ## Notes
 This server never decrypts user messages or identity private keys. All encryption and key derivation happen on the client, and the backend stores only encrypted blobs and metadata. Refer to [frontend.md](frontend.md) for the cryptographic contract that clients must follow.
+
+## License
+This project is licensed under the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for the full license text.
+
+All previous versions and all future versions of this software are covered by this same license unless explicitly stated otherwise in writing by the copyright holder.

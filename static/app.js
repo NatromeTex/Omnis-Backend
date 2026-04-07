@@ -430,7 +430,6 @@ const replyPreview = document.getElementById('reply-preview');
 const replyUsername = document.getElementById('reply-username');
 const replyCancelBtn = document.getElementById('reply-cancel-btn');
 const newChatUsername = document.getElementById('new-chat-username');
-const newChatBtn = document.getElementById('new-chat-btn');
 const logoutBtn = document.getElementById('logout-btn');
 const tabBtns = document.querySelectorAll('.tab-btn');
 const fileInput = document.getElementById('file-input');
@@ -474,6 +473,10 @@ function setupEventListeners() {
                 signupForm.classList.remove('hidden');
             }
             authError.textContent = '';
+            // Clear validation state on the hidden form
+            document.querySelectorAll('.auth-form input').forEach(el => {
+                el.classList.remove('valid', 'invalid');
+            });
         });
     });
 
@@ -496,8 +499,11 @@ function setupEventListeners() {
     // Logout
     logoutBtn.addEventListener('click', logout);
 
-    // New chat
-    newChatBtn.addEventListener('click', createNewChat);
+    // Back button (mobile)
+    const backBtn = document.getElementById('back-btn');
+    if (backBtn) backBtn.addEventListener('click', showSidebar);
+
+    // New chat via Enter key
     newChatUsername.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') createNewChat();
     });
@@ -505,7 +511,7 @@ function setupEventListeners() {
     // User search
     newChatUsername.addEventListener('input', handleUserSearchInput);
     newChatUsername.addEventListener('focus', () => {
-        if (newChatUsername.value.trim().length > 0) handleUserSearchInput();
+        if (newChatUsername.value.trim().length >= 3) handleUserSearchInput();
     });
     document.addEventListener('click', (e) => {
         if (!e.target.closest('.search-wrapper')) {
@@ -528,6 +534,10 @@ function setupEventListeners() {
         clearReplyTarget();
     });
     
+    // Signup field validation (visual feedback only)
+    setupFieldValidation('signup-username', v => v.length >= 5 && v.length <= 32);
+    setupFieldValidation('signup-password', v => v.length >= 6);
+
     // Account section
     document.getElementById('account-section').addEventListener('click', openAccountModal);
     document.getElementById('close-modal-btn').addEventListener('click', closeAccountModal);
@@ -746,6 +756,14 @@ function showChatSection() {
     updateAccountSection();
 }
 
+function showSidebar() {
+    document.getElementById('chat-layout').classList.remove('chat-open');
+}
+
+function showChat() {
+    document.getElementById('chat-layout').classList.add('chat-open');
+}
+
 // ==================== CHAT FUNCTIONS ====================
 
 async function loadChats() {
@@ -804,7 +822,7 @@ function handleUserSearchInput() {
     const query = newChatUsername.value.trim();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
 
-    if (query.length === 0) {
+    if (query.length < 3) {
         searchResults.classList.add('hidden');
         return;
     }
@@ -972,11 +990,22 @@ async function openChat(chatId, username) {
     currentChatId = chatId;
     currentChatPeer = username;
     clearReplyTarget();
-    
+
     // Update UI
     chatPlaceholder.classList.add('hidden');
     chatView.classList.remove('hidden');
     chatWithUser.textContent = username;
+
+    // Set peer avatar
+    const peerAvatar = document.getElementById('chat-peer-avatar');
+    if (peerAvatar) {
+        const firstLetter = username.charAt(0).toUpperCase();
+        peerAvatar.textContent = firstLetter;
+        peerAvatar.style.backgroundColor = getColorForLetter(firstLetter);
+    }
+
+    // On mobile, show the chat panel
+    showChat();
     
     // Update active state in list using data-chat-id
     document.querySelectorAll('.chat-item').forEach(item => {
@@ -1017,6 +1046,10 @@ async function loadMessages() {
         // Decrypt messages
         const decryptedMessages = [];
         for (const msg of data.messages) {
+            if (msg.deleted) {
+                decryptedMessages.push({ ...msg, body: null });
+                continue;
+            }
             const epochKey = KeyStore.getEpochKey(currentChatId, msg.epoch_id);
             if (epochKey) {
                 try {
@@ -1056,19 +1089,20 @@ function renderMessages(messages) {
     
     messages.forEach(msg => {
         const isSent = msg.sender_id === currentUserId;
+        const isDeleted = !!msg.deleted;
         const div = document.createElement('div');
-        const hasAttachments = msg.attachments && msg.attachments.length > 0;
-        div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}`;
+        const hasAttachments = !isDeleted && msg.attachments && msg.attachments.length > 0;
+        div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}${isDeleted ? ' deleted-message' : ''}`;
         div.dataset.msgId = msg.id;
         div.dataset.senderId = msg.sender_id;
-        
-        const time = parseUTCDate(msg.created_at).toLocaleTimeString([], { 
-            hour: '2-digit', 
-            minute: '2-digit' 
+
+        const time = parseUTCDate(msg.created_at).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit'
         });
-        
+
         let replyHtml = '';
-        if (msg.reply_id) {
+        if (msg.reply_id && !isDeleted) {
             const replyTarget = messageMap.get(msg.reply_id);
             const replySender = replyTarget ? getSenderLabel(replyTarget.sender_id) : 'Original message';
             const replyText = replyTarget ? getReplyPreviewText(replyTarget.body, 140) : '[Original message unavailable]';
@@ -1080,9 +1114,10 @@ function renderMessages(messages) {
             `;
         }
 
+        const bodyText = isDeleted ? 'This message was deleted' : escapeHtml(msg.body);
         div.innerHTML = `
             ${replyHtml}
-            <div class="text">${escapeHtml(msg.body)}</div>
+            <div class="text">${bodyText}</div>
             <div class="time">${time}</div>
         `;
 
@@ -1098,22 +1133,37 @@ function renderMessages(messages) {
             div.insertBefore(attachContainer, timeEl);
         }
 
-        const actions = document.createElement('div');
-        actions.className = 'message-actions';
+        if (!isDeleted) {
+            const actions = document.createElement('div');
+            actions.className = 'message-actions';
 
-        const replyBtn = document.createElement('button');
-        replyBtn.type = 'button';
-        replyBtn.className = 'reply-btn';
-        replyBtn.title = 'Reply';
-        replyBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
-        replyBtn.addEventListener('click', (event) => {
-            event.stopPropagation();
-            setReplyTarget(msg);
-        });
+            const replyBtn = document.createElement('button');
+            replyBtn.type = 'button';
+            replyBtn.className = 'reply-btn';
+            replyBtn.title = 'Reply';
+            replyBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
+            replyBtn.addEventListener('click', (event) => {
+                event.stopPropagation();
+                setReplyTarget(msg);
+            });
+            actions.appendChild(replyBtn);
 
-        actions.appendChild(replyBtn);
-        div.appendChild(actions);
-        
+            if (isSent) {
+                const deleteBtn = document.createElement('button');
+                deleteBtn.type = 'button';
+                deleteBtn.className = 'delete-msg-btn';
+                deleteBtn.title = 'Delete';
+                deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+                deleteBtn.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    deleteMessage(msg.id);
+                });
+                actions.appendChild(deleteBtn);
+            }
+
+            div.appendChild(actions);
+        }
+
         messagesContainer.appendChild(div);
     });
 
@@ -1638,19 +1688,11 @@ function connectChatWebSocket(chatId) {
 
     if (!authToken) return;
 
-    // Open a plain WebSocket — no credentials in URL to prevent leakage
-    // through server logs, proxy logs, browser history, and referrer headers.
-    const url = `${WS_BASE}/chat/ws/${chatId}`;
+    const url = `${WS_BASE}/chat/ws/${chatId}?token=${encodeURIComponent(authToken)}&device_id=${encodeURIComponent(deviceId)}`;
     chatSocket = new WebSocket(url);
 
     chatSocket.addEventListener('open', () => {
-        console.log(`WS connected to chat ${chatId}, sending auth frame`);
-        // Authenticate via the first message (server expects this within 10 s)
-        chatSocket.send(JSON.stringify({
-            type: 'auth',
-            token: authToken,
-            device_id: deviceId
-        }));
+        console.log(`WS connected to chat ${chatId}`);
     });
 
     chatSocket.addEventListener('message', async (event) => {
@@ -1663,6 +1705,8 @@ function connectChatWebSocket(chatId) {
             } else if (data.type === 'new_message') {
                 // Single new message pushed from server
                 await handleNewMessagePayload(data.message);
+            } else if (data.type === 'message_deleted') {
+                handleMessageDeleted(data.message_id);
             } else if (data.type === 'pong') {
                 // heartbeat ack – ignore
             }
@@ -1747,6 +1791,11 @@ async function handleHistoryPayload(data) {
 async function handleNewMessagePayload(msg) {
     if (!currentChatPeer) return;
 
+    if (msg.deleted) {
+        appendMessage({ ...msg, body: null });
+        return;
+    }
+
     // Ensure we have the epoch key
     if (!KeyStore.getEpochKey(currentChatId, msg.epoch_id)) {
         try {
@@ -1776,6 +1825,10 @@ async function handleNewMessagePayload(msg) {
 async function decryptMessageBatch(messages) {
     const decrypted = [];
     for (const msg of messages) {
+        if (msg.deleted) {
+            decrypted.push({ ...msg, body: null });
+            continue;
+        }
         const epochKey = KeyStore.getEpochKey(currentChatId, msg.epoch_id);
         if (epochKey) {
             try {
@@ -1795,9 +1848,10 @@ async function decryptMessageBatch(messages) {
 // Append a single decrypted message to the chat view
 function appendMessage(msg) {
     const isSent = msg.sender_id === currentUserId;
+    const isDeleted = !!msg.deleted;
     const div = document.createElement('div');
-    const hasAttachments = msg.attachments && msg.attachments.length > 0;
-    div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}`;
+    const hasAttachments = !isDeleted && msg.attachments && msg.attachments.length > 0;
+    div.className = `message ${isSent ? 'sent' : 'received'}${hasAttachments ? ' has-media' : ''}${isDeleted ? ' deleted-message' : ''}`;
     div.dataset.msgId = msg.id;
     div.dataset.senderId = msg.sender_id;
 
@@ -1807,7 +1861,7 @@ function appendMessage(msg) {
     });
 
     let replyHtml = '';
-    if (msg.reply_id) {
+    if (msg.reply_id && !isDeleted) {
         // Try to find the reply target from already-rendered messages
         const allRendered = messagesContainer.querySelectorAll('.message');
         let replySender = 'Reply';
@@ -1827,9 +1881,10 @@ function appendMessage(msg) {
         `;
     }
 
+    const bodyText = isDeleted ? 'This message was deleted' : escapeHtml(msg.body);
     div.innerHTML = `
         ${replyHtml}
-        <div class="text">${escapeHtml(msg.body)}</div>
+        <div class="text">${bodyText}</div>
         <div class="time">${time}</div>
     `;
 
@@ -1844,22 +1899,64 @@ function appendMessage(msg) {
         div.insertBefore(attachContainer, timeEl);
     }
 
-    const actions = document.createElement('div');
-    actions.className = 'message-actions';
-    const replyBtn = document.createElement('button');
-    replyBtn.type = 'button';
-    replyBtn.className = 'reply-btn';
-    replyBtn.title = 'Reply';
-    replyBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
-    replyBtn.addEventListener('click', (event) => {
-        event.stopPropagation();
-        setReplyTarget(msg);
-    });
-    actions.appendChild(replyBtn);
-    div.appendChild(actions);
+    if (!isDeleted) {
+        const actions = document.createElement('div');
+        actions.className = 'message-actions';
+
+        const replyBtn = document.createElement('button');
+        replyBtn.type = 'button';
+        replyBtn.className = 'reply-btn';
+        replyBtn.title = 'Reply';
+        replyBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
+        replyBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            setReplyTarget(msg);
+        });
+        actions.appendChild(replyBtn);
+
+        if (isSent) {
+            const deleteBtn = document.createElement('button');
+            deleteBtn.type = 'button';
+            deleteBtn.className = 'delete-msg-btn';
+            deleteBtn.title = 'Delete';
+            deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+            deleteBtn.addEventListener('click', (event) => {
+                event.stopPropagation();
+                deleteMessage(msg.id);
+            });
+            actions.appendChild(deleteBtn);
+        }
+
+        div.appendChild(actions);
+    }
 
     messagesContainer.appendChild(div);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+// Handle a message_deleted WS event (or local delete)
+function handleMessageDeleted(messageId) {
+    const el = messagesContainer.querySelector(`.message[data-msg-id="${messageId}"]`);
+    if (!el) return;
+    el.classList.add('deleted-message');
+    const textEl = el.querySelector('.text');
+    if (textEl) textEl.textContent = 'This message was deleted';
+    // Remove attachments if present
+    const attachEl = el.querySelector('.message-attachments');
+    if (attachEl) attachEl.remove();
+    // Remove action buttons
+    const actionsEl = el.querySelector('.message-actions');
+    if (actionsEl) actionsEl.remove();
+}
+
+async function deleteMessage(msgId) {
+    if (!confirm('Delete this message?')) return;
+    try {
+        await apiCall(`/chat/${currentChatId}/message/${msgId}`, { method: 'DELETE' });
+        handleMessageDeleted(msgId);
+    } catch (error) {
+        alert('Failed to delete message: ' + error.message);
+    }
 }
 
 // ==================== ATTACHMENT RENDERING ====================
@@ -2254,6 +2351,26 @@ function clearReplyTarget() {
 }
 
 // ==================== UTILITY FUNCTIONS ====================
+
+function setupFieldValidation(id, isValid) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('input', () => {
+        if (el.value.length === 0) {
+            el.classList.remove('valid', 'invalid');
+        } else if (isValid(el.value)) {
+            el.classList.add('valid');
+            el.classList.remove('invalid');
+        } else {
+            el.classList.add('invalid');
+            el.classList.remove('valid');
+        }
+    });
+    // Clear state when the form resets (e.g. switching tabs)
+    el.closest('form')?.addEventListener('reset', () => {
+        el.classList.remove('valid', 'invalid');
+    });
+}
 
 function escapeHtml(text) {
     const div = document.createElement('div');

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Omnis Chat</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link rel="stylesheet" href="style.css">
@@ -13,62 +13,89 @@
         <!-- Auth Section -->
         <div id="auth-section" class="section">
             <div class="auth-card">
+                <div class="auth-logo">
+                    <i class="fa-solid fa-lock"></i>
+                </div>
                 <h1>Omnis Chat</h1>
+                <p class="auth-subtitle">End-to-end encrypted messaging</p>
                 <div class="tabs">
                     <button class="tab-btn active" data-tab="login">Login</button>
                     <button class="tab-btn" data-tab="signup">Sign Up</button>
                 </div>
-                
+
                 <form id="login-form" class="auth-form">
-                    <input type="text" id="login-username" placeholder="Username" required>
-                    <input type="password" id="login-password" placeholder="Password" required>
-                    <button type="submit" class="btn primary">Login</button>
+                    <div class="input-group">
+                        <i class="fa-solid fa-user input-icon"></i>
+                        <input type="text" id="login-username" placeholder="Username" autocomplete="username" required>
+                    </div>
+                    <div class="input-group">
+                        <i class="fa-solid fa-key input-icon"></i>
+                        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+                    </div>
+                    <button type="submit" class="btn primary full-width">Login</button>
                 </form>
-                
+
                 <form id="signup-form" class="auth-form hidden">
-                    <input type="text" id="signup-username" placeholder="Username" required>
-                    <input type="password" id="signup-password" placeholder="Password" required>
-                    <button type="submit" class="btn primary">Sign Up</button>
+                    <div class="input-group">
+                        <i class="fa-solid fa-user input-icon"></i>
+                        <input type="text" id="signup-username" placeholder="Username" autocomplete="username" required>
+                    </div>
+                    <div class="input-group">
+                        <i class="fa-solid fa-key input-icon"></i>
+                        <input type="password" id="signup-password" placeholder="Password" autocomplete="new-password" required>
+                    </div>
+                    <button type="submit" class="btn primary full-width">Sign Up</button>
                 </form>
-                
+
                 <div id="auth-error" class="error-message"></div>
             </div>
         </div>
 
         <!-- Chat Section -->
         <div id="chat-section" class="section hidden">
-            <div class="chat-layout">
+            <div class="chat-layout" id="chat-layout">
                 <!-- Sidebar -->
-                <div class="sidebar">
+                <aside class="sidebar" id="sidebar">
                     <div class="sidebar-header">
-                        <h2>Chats</h2>
-                        <button id="logout-btn" class="btn small">Logout</button>
+                        <span class="sidebar-title">Omnis</span>
+                        <button id="logout-btn" class="btn icon-btn" title="Logout">
+                            <i class="fa-solid fa-arrow-right-from-bracket"></i>
+                        </button>
                     </div>
                     <div class="new-chat">
                         <div class="search-wrapper">
+                            <i class="fa-solid fa-magnifying-glass search-icon"></i>
                             <input type="text" id="new-chat-username" placeholder="Search users..." autocomplete="off">
                             <div id="search-results" class="search-results hidden"></div>
                         </div>
-                        <button id="new-chat-btn" class="btn primary small">+</button>
                     </div>
                     <div id="chat-list" class="chat-list"></div>
-                    
+
                     <!-- Account Section -->
                     <div id="account-section" class="account-section">
                         <div id="account-pfp" class="account-pfp">U</div>
                         <span id="account-username" class="account-username">Username</span>
+                        <i class="fa-solid fa-chevron-right account-chevron"></i>
                     </div>
-                </div>
+                </aside>
 
                 <!-- Chat Area -->
-                <div class="chat-area">
+                <main class="chat-area" id="chat-area">
                     <div id="chat-placeholder" class="chat-placeholder">
+                        <div class="placeholder-icon"><i class="fa-solid fa-message"></i></div>
                         <p>Select a chat to start messaging</p>
+                        <span class="placeholder-sub">Your messages are end-to-end encrypted</span>
                     </div>
-                    
+
                     <div id="chat-view" class="chat-view hidden">
                         <div class="chat-header">
-                            <h3 id="chat-with-user">Chat</h3>
+                            <button id="back-btn" class="btn icon-btn back-btn" title="Back" aria-label="Back to chats">
+                                <i class="fa-solid fa-arrow-left"></i>
+                            </button>
+                            <div class="chat-header-peer">
+                                <div id="chat-peer-avatar" class="peer-avatar">?</div>
+                                <h3 id="chat-with-user">Chat</h3>
+                            </div>
                             <span id="encryption-badge" class="encryption-badge" title="End-to-End Encrypted">
                                 <i class="fa-solid fa-lock"></i> E2EE
                             </span>
@@ -76,41 +103,47 @@
                         <div id="messages-container" class="messages-container"></div>
                         <div id="reply-bar" class="reply-bar hidden">
                             <div class="reply-meta">
-                                <span class="reply-label">Replying to <span id="reply-username">User</span></span>
-                                <button id="reply-cancel-btn" class="btn small ghost" type="button">Cancel</button>
+                                <span class="reply-label"><i class="fa-solid fa-reply"></i> Replying to <strong id="reply-username">User</strong></span>
+                                <button id="reply-cancel-btn" class="btn icon-btn" type="button" aria-label="Cancel reply">
+                                    <i class="fa-solid fa-xmark"></i>
+                                </button>
                             </div>
                             <div id="reply-preview" class="reply-preview"></div>
                         </div>
                         <div id="attachment-preview" class="attachment-preview hidden"></div>
                         <form id="message-form" class="message-form">
                             <input type="file" id="file-input" multiple hidden>
-                            <button type="button" id="attach-btn" class="btn attach-btn" title="Attach file">
+                            <button type="button" id="attach-btn" class="btn icon-btn attach-btn" title="Attach file" aria-label="Attach file">
                                 <i class="fa-solid fa-paperclip"></i>
                             </button>
-                            <input type="text" id="message-input" placeholder="Type a message...">
-                            <button type="submit" class="btn primary">Send</button>
+                            <input type="text" id="message-input" placeholder="Message..." autocomplete="off">
+                            <button type="submit" class="btn send-btn" aria-label="Send message">
+                                <i class="fa-solid fa-paper-plane"></i>
+                            </button>
                         </form>
                     </div>
-                </div>
+                </main>
             </div>
         </div>
     </div>
 
-    <!-- Account Modal (outside main sections to avoid z-index issues) -->
-    <div id="account-modal" class="modal hidden">
+    <!-- Account Modal -->
+    <div id="account-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Account">
         <div class="modal-content">
             <div class="modal-header">
                 <h3>Account</h3>
-                <button id="close-modal-btn" class="close-btn">&times;</button>
+                <button id="close-modal-btn" class="btn icon-btn" aria-label="Close">&times;</button>
             </div>
             <div class="modal-body">
                 <h4>Active Sessions</h4>
                 <div id="sessions-list" class="sessions-list"></div>
-                <button id="revoke-other-btn" class="btn revoke-all-btn">Log out of all other sessions</button>
+                <button id="revoke-other-btn" class="btn revoke-all-btn">
+                    <i class="fa-solid fa-right-from-bracket"></i> Log out all other sessions
+                </button>
             </div>
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.min.js"></script>
 </body>
 </html>

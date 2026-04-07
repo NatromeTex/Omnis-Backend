@@ -138,3 +138,8 @@ cython_debug/
 
 # media uploads
 uploads/*
+
+# runtime files
+/static/app.min.js
+chat.db-shm
+chat.db-wal
