@@ -503,6 +503,9 @@ function setupEventListeners() {
     const backBtn = document.getElementById('back-btn');
     if (backBtn) backBtn.addEventListener('click', showSidebar);
 
+    // Call button
+    if (callBtn) callBtn.addEventListener('click', initiateCall);
+
     // New chat via Enter key
     newChatUsername.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') createNewChat();
@@ -716,6 +719,7 @@ function showAuthSection() {
 }
 
 function clearChatUi() {
+    cleanupCall();
     chatList.innerHTML = '';
     messagesContainer.innerHTML = '';
     chatWithUser.textContent = 'Chat';
@@ -1088,6 +1092,11 @@ function renderMessages(messages) {
     });
     
     messages.forEach(msg => {
+        if (msg.message_type === 'call') {
+            messagesContainer.appendChild(buildCallMessageEl(msg));
+            return;
+        }
+
         const isSent = msg.sender_id === currentUserId;
         const isDeleted = !!msg.deleted;
         const div = document.createElement('div');
@@ -1707,6 +1716,8 @@ function connectChatWebSocket(chatId) {
                 await handleNewMessagePayload(data.message);
             } else if (data.type === 'message_deleted') {
                 handleMessageDeleted(data.message_id);
+            } else if (data.type === 'call_incoming') {
+                handleIncomingCall(data);
             } else if (data.type === 'pong') {
                 // heartbeat ack – ignore
             }
@@ -1791,6 +1802,11 @@ async function handleHistoryPayload(data) {
 async function handleNewMessagePayload(msg) {
     if (!currentChatPeer) return;
 
+    if (msg.message_type === 'call') {
+        appendMessage(msg);
+        return;
+    }
+
     if (msg.deleted) {
         appendMessage({ ...msg, body: null });
         return;
@@ -1825,6 +1841,10 @@ async function handleNewMessagePayload(msg) {
 async function decryptMessageBatch(messages) {
     const decrypted = [];
     for (const msg of messages) {
+        if (msg.message_type === 'call') {
+            decrypted.push({ ...msg });
+            continue;
+        }
         if (msg.deleted) {
             decrypted.push({ ...msg, body: null });
             continue;
@@ -1847,6 +1867,12 @@ async function decryptMessageBatch(messages) {
 
 // Append a single decrypted message to the chat view
 function appendMessage(msg) {
+    if (msg.message_type === 'call') {
+        messagesContainer.appendChild(buildCallMessageEl(msg));
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        return;
+    }
+
     const isSent = msg.sender_id === currentUserId;
     const isDeleted = !!msg.deleted;
     const div = document.createElement('div');
@@ -2385,4 +2411,585 @@ function parseUTCDate(dateString) {
         return new Date(dateString + 'Z');
     }
     return new Date(dateString);
+}
+
+// ==================== CALL FEATURE ====================
+
+// ── State ──────────────────────────────────────────────────────
+let callState = 'idle';   // idle | outgoing | incoming | active
+let callId    = null;     // current call UUID
+let callSocket = null;    // WebSocket for call signaling + audio relay
+let callKey    = null;    // AES-256 call session key (E2EE)
+let callPeer   = null;    // username of the remote party
+let callIsInitiator = false;
+
+let callTimerInterval  = null;
+let callSeconds        = 0;
+let callHeartbeatTimer = null;
+
+// Audio capture
+let audioStream       = null;   // local MediaStream from getUserMedia
+let mediaRecorder     = null;   // MediaRecorder for Opus encoding
+let audioSeq          = 0;      // outgoing frame sequence number
+let isFirstAudioChunk = true;
+let callAudioMimeType = '';
+
+// Audio playback (MediaSource streaming)
+let audioMediaSource        = null;
+let audioSourceBuffer       = null;
+let pendingAudioBuffers     = [];
+let audioSourceBufferReady  = false;
+
+// ── DOM refs ───────────────────────────────────────────────────
+const callBtn   = document.getElementById('call-btn');
+const callPill  = document.getElementById('call-pill');
+const callAudioEl = document.getElementById('call-audio');
+
+// ── Pill UI ────────────────────────────────────────────────────
+function showCallPill(state, peerName) {
+    callPill.classList.remove('hidden', 'incoming', 'active-call');
+
+    if (state === 'incoming') {
+        callPill.classList.add('incoming');
+        callPill.innerHTML = `
+            <div class="call-pill-info">
+                <span class="call-pill-icon"><i class="fa-solid fa-phone-volume"></i></span>
+                <span class="call-pill-text">${escapeHtml(peerName)} is calling</span>
+            </div>
+            <div class="call-pill-actions">
+                <button class="accept-btn" title="Accept" aria-label="Accept call" onclick="acceptCall()">
+                    <i class="fa-solid fa-phone"></i>
+                </button>
+                <button class="reject-btn" title="Decline" aria-label="Decline call" onclick="rejectCall()">
+                    <i class="fa-solid fa-phone-slash"></i>
+                </button>
+            </div>`;
+    } else if (state === 'outgoing') {
+        callPill.innerHTML = `
+            <div class="call-pill-info">
+                <span class="call-pill-icon"><i class="fa-solid fa-phone"></i></span>
+                <span class="call-pill-text">Calling ${escapeHtml(peerName)}\u2026</span>
+            </div>
+            <div class="call-pill-actions">
+                <button class="end-btn" title="Cancel" aria-label="Cancel call" onclick="endCall()">
+                    <i class="fa-solid fa-phone-slash"></i>
+                </button>
+            </div>`;
+    } else if (state === 'active') {
+        callPill.classList.add('active-call');
+        callPill.innerHTML = `
+            <div class="call-pill-info">
+                <span class="call-pill-icon" style="color:#4caf50"><i class="fa-solid fa-phone"></i></span>
+                <span class="call-pill-text" id="call-timer-display">0:00</span>
+            </div>
+            <div class="call-pill-actions">
+                <button class="end-btn" title="End call" aria-label="End call" onclick="endCall()">
+                    <i class="fa-solid fa-phone-slash"></i>
+                </button>
+            </div>`;
+        startCallTimer();
+    }
+
+    if (callBtn) callBtn.classList.toggle('in-call', state !== 'idle');
+}
+
+function hideCallPill() {
+    callPill.classList.add('hidden');
+    callPill.classList.remove('incoming', 'active-call');
+    callPill.innerHTML = '';
+    if (callBtn) callBtn.classList.remove('in-call');
+}
+
+function startCallTimer() {
+    callSeconds = 0;
+    stopCallTimer();
+    callTimerInterval = setInterval(() => {
+        callSeconds++;
+        const el = document.getElementById('call-timer-display');
+        if (el) {
+            const m = Math.floor(callSeconds / 60);
+            const s = String(callSeconds % 60).padStart(2, '0');
+            el.textContent = `${m}:${s}`;
+        }
+    }, 1000);
+}
+
+function stopCallTimer() {
+    if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
+}
+
+// ── Call messages in chat ──────────────────────────────────────
+function buildCallMessageEl(msg) {
+    const div = document.createElement('div');
+    div.className = 'message call-message';
+    div.dataset.msgId = msg.id;
+
+    const time = parseUTCDate(msg.created_at).toLocaleTimeString([], {
+        hour: '2-digit', minute: '2-digit',
+    });
+
+    let iconCls, iconColor, label;
+    switch (msg.call_status) {
+        case 'ended': {
+            iconCls   = 'fa-phone';
+            iconColor = '#4caf50';
+            const dur = msg.duration_seconds ? formatCallDuration(msg.duration_seconds) : '';
+            label     = dur
+                ? `Call ended <span class="call-msg-duration">\u00b7 ${escapeHtml(dur)}</span>`
+                : 'Call ended';
+            break;
+        }
+        case 'missed':
+            iconCls   = 'fa-phone-flip';
+            iconColor = '#f4a43a';
+            label     = 'Missed call';
+            break;
+        case 'rejected':
+            iconCls   = 'fa-phone-slash';
+            iconColor = '#e53935';
+            label     = 'Call declined';
+            break;
+        default:
+            iconCls   = 'fa-phone';
+            iconColor = 'var(--text-secondary)';
+            label     = 'Call';
+    }
+
+    div.innerHTML =
+        `<i class="fa-solid ${iconCls} call-msg-icon" style="color:${iconColor}"></i>` +
+        `${label}` +
+        `<span class="time">${time}</span>`;
+
+    return div;
+}
+
+function formatCallDuration(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = String(seconds % 60).padStart(2, '0');
+    return `${m}:${s}`;
+}
+
+// ── Initiate call (caller side) ───────────────────────────────
+async function initiateCall() {
+    if (!currentChatId || !currentChatPeer || callState !== 'idle') return;
+
+    try {
+        const resp = await fetch(`${API_BASE}/call/${currentChatId}/initiate`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'X-Device-ID': deviceId,
+            },
+        });
+
+        if (!resp.ok) {
+            if (resp.status === 409) { alert('A call is already active in this chat.'); }
+            else { console.error('Failed to initiate call:', resp.status); }
+            return;
+        }
+
+        const data = await resp.json();
+        callId          = data.call_id;
+        callPeer        = currentChatPeer;
+        callIsInitiator = true;
+        callState       = 'outgoing';
+
+        showCallPill('outgoing', callPeer);
+        setupCallWebSocket(callId, true);
+    } catch (e) {
+        console.error('initiateCall error:', e);
+    }
+}
+
+// ── Incoming call (callee side) ────────────────────────────────
+function handleIncomingCall(data) {
+    if (data.chat_id !== currentChatId || callState !== 'idle') return;
+
+    callId          = data.call_id;
+    callPeer        = currentChatPeer;
+    callIsInitiator = false;
+    callState       = 'incoming';
+
+    showCallPill('incoming', callPeer);
+}
+
+async function acceptCall() {
+    if (callState !== 'incoming' || !callId) return;
+
+    try {
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+        console.error('Microphone denied:', e);
+        alert('Microphone access is required to accept the call.');
+        hideCallPill();
+        callState = 'idle';
+        callId    = null;
+        return;
+    }
+
+    // Show connecting state while we exchange offer/answer
+    showCallPill('outgoing', callPeer);
+    callState = 'connecting';
+    setupCallWebSocket(callId, false);
+}
+
+async function rejectCall() {
+    if (!callId) { hideCallPill(); callState = 'idle'; return; }
+
+    const savedId = callId;
+    hideCallPill();
+    callState = 'idle';
+    callId    = null;
+
+    // Connect briefly just to send reject
+    const url = `${WS_BASE}/call/ws/${savedId}?token=${encodeURIComponent(authToken)}&device_id=${encodeURIComponent(deviceId)}`;
+    const ws  = new WebSocket(url);
+    ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ type: 'reject' }));
+        setTimeout(() => ws.close(), 400);
+    });
+    ws.addEventListener('error', () => ws.close());
+}
+
+// ── Call WebSocket ─────────────────────────────────────────────
+function setupCallWebSocket(id, isInitiator) {
+    closeCallWebSocket();
+
+    const url = `${WS_BASE}/call/ws/${id}?token=${encodeURIComponent(authToken)}&device_id=${encodeURIComponent(deviceId)}`;
+    callSocket = new WebSocket(url);
+
+    callSocket.addEventListener('open', () => {
+        console.log('Call WS connected');
+        startCallHeartbeat();
+    });
+
+    callSocket.addEventListener('message', async (event) => {
+        try {
+            await handleCallWsMessage(JSON.parse(event.data), isInitiator);
+        } catch (e) {
+            console.error('Call WS message error:', e);
+        }
+    });
+
+    callSocket.addEventListener('close', (evt) => {
+        console.log(`Call WS closed (code=${evt.code})`);
+        stopCallHeartbeat();
+        callSocket = null;
+        if (callState !== 'idle') cleanupCall();
+    });
+
+    callSocket.addEventListener('error', () => {});
+}
+
+async function handleCallWsMessage(data, isInitiator) {
+    switch (data.type) {
+        case 'call_state':
+            if (data.status === 'ringing' && isInitiator && callState === 'outgoing') {
+                // Callee has connected — now send the offer
+                await sendCallOffer();
+            } else if (['missed', 'rejected', 'ended'].includes(data.status)) {
+                cleanupCall();
+            }
+            break;
+
+        case 'offer':
+            if (!isInitiator) await handleCallOffer(data);
+            break;
+
+        case 'answer':
+            if (isInitiator && callState === 'outgoing') {
+                callState = 'active';
+                showCallPill('active', callPeer);
+                await startAudioCapture();
+            }
+            break;
+
+        case 'audio_frame':
+            await handleAudioFrame(data);
+            break;
+
+        case 'rejected':
+        case 'ended':
+            cleanupCall();
+            break;
+
+        case 'pong':
+            break;
+    }
+}
+
+// ── Offer / answer key exchange ────────────────────────────────
+async function sendCallOffer() {
+    if (!callSocket || callSocket.readyState !== WebSocket.OPEN) return;
+
+    try {
+        // Generate a fresh AES-256 call session key
+        callKey = await Crypto.generateEpochKey();
+
+        // Wrap for callee using their public key + our private key (same ECDH mechanism as epoch keys)
+        const peerPubKey = await getPeerPublicKey(callPeer);
+        const keyPair    = KeyStore.getIdentityKeyPair();
+        if (!peerPubKey || !keyPair) { endCall(); return; }
+
+        const wrappedKey = await Crypto.wrapEpochKeyForRecipient(
+            callKey, keyPair.privateKey, peerPubKey
+        );
+
+        callSocket.send(JSON.stringify({
+            type: 'offer',
+            sdp: '',
+            wrapped_call_key: wrappedKey,
+        }));
+
+        // Request mic permission for the caller now that we have a confirmed callee
+        if (!audioStream) {
+            try {
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (e) {
+                alert('Microphone access is required for calls.');
+                endCall();
+            }
+        }
+    } catch (e) {
+        console.error('sendCallOffer error:', e);
+        endCall();
+    }
+}
+
+async function handleCallOffer(offer) {
+    try {
+        // Unwrap call session key using caller's public key + our private key
+        const callerPubKey = await getPeerPublicKey(callPeer);
+        const keyPair      = KeyStore.getIdentityKeyPair();
+        if (!callerPubKey || !keyPair) { endCall(); return; }
+
+        callKey = await Crypto.unwrapEpochKey(
+            offer.wrapped_call_key, keyPair.privateKey, callerPubKey
+        );
+
+        if (callSocket && callSocket.readyState === WebSocket.OPEN) {
+            callSocket.send(JSON.stringify({ type: 'answer', sdp: '' }));
+        }
+
+        callState = 'active';
+        showCallPill('active', callPeer);
+        await startAudioCapture();
+    } catch (e) {
+        console.error('handleCallOffer error:', e);
+        endCall();
+    }
+}
+
+// ── Audio capture (MediaRecorder → encrypt → WS) ──────────────
+function getAudioMimeType() {
+    const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg',
+    ];
+    return candidates.find(t => {
+        try { return MediaRecorder.isTypeSupported(t); } catch { return false; }
+    }) || '';
+}
+
+async function startAudioCapture() {
+    if (!audioStream) return;
+
+    callAudioMimeType = getAudioMimeType();
+    if (!callAudioMimeType) { console.error('No supported audio MIME type'); return; }
+
+    isFirstAudioChunk = true;
+    audioSeq = 0;
+
+    try {
+        mediaRecorder = new MediaRecorder(audioStream, {
+            mimeType: callAudioMimeType,
+            audioBitsPerSecond: 64000,
+        });
+    } catch {
+        mediaRecorder = new MediaRecorder(audioStream, { mimeType: callAudioMimeType });
+    }
+
+    mediaRecorder.ondataavailable = async (e) => {
+        if (e.data.size === 0) return;
+        if (!callSocket || callSocket.readyState !== WebSocket.OPEN) return;
+        if (!callKey) return;
+
+        try {
+            const buffer    = await e.data.arrayBuffer();
+            const nonce     = Crypto.randomBytes(12);
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: nonce }, callKey, buffer
+            );
+
+            const frame = {
+                type:  'audio_frame',
+                data:  Crypto.arrayBufferToBase64(encrypted),
+                seq:   audioSeq++,
+                nonce: Crypto.arrayBufferToBase64(nonce),
+            };
+
+            const markedInit = isFirstAudioChunk;
+            if (isFirstAudioChunk) {
+                frame.is_init = true;
+                frame.mime    = callAudioMimeType;
+            }
+
+            const msg = JSON.stringify(frame);
+            if (msg.length <= 4096) {
+                callSocket.send(msg);
+                if (markedInit) isFirstAudioChunk = false;
+            }
+        } catch (e) {
+            console.error('Audio encode/encrypt error:', e);
+        }
+    };
+
+    mediaRecorder.start(100); // 100 ms chunks — ~800 bytes raw at 64 kbps
+}
+
+// ── Audio playback (decrypt → MediaSource) ────────────────────
+function initAudioPlayback(mimeType) {
+    if (!('MediaSource' in window)) { console.warn('MediaSource not supported'); return; }
+    if (!MediaSource.isTypeSupported(mimeType)) {
+        // Try a simpler type
+        if (mimeType.includes('webm') && MediaSource.isTypeSupported('audio/webm')) {
+            mimeType = 'audio/webm';
+        } else {
+            console.warn('MediaSource does not support:', mimeType);
+            return;
+        }
+    }
+
+    pendingAudioBuffers    = [];
+    audioSourceBufferReady = false;
+    audioMediaSource       = new MediaSource();
+    callAudioEl.src        = URL.createObjectURL(audioMediaSource);
+
+    audioMediaSource.addEventListener('sourceopen', () => {
+        try {
+            audioSourceBuffer       = audioMediaSource.addSourceBuffer(mimeType);
+            audioSourceBuffer.mode  = 'sequence';
+
+            audioSourceBuffer.addEventListener('updateend', () => {
+                audioSourceBufferReady = true;
+                if (pendingAudioBuffers.length > 0) {
+                    try { audioSourceBuffer.appendBuffer(pendingAudioBuffers.shift()); audioSourceBufferReady = false; }
+                    catch (e) { console.error('appendBuffer:', e); }
+                }
+            });
+
+            audioSourceBufferReady = true;
+            if (pendingAudioBuffers.length > 0) {
+                try { audioSourceBuffer.appendBuffer(pendingAudioBuffers.shift()); audioSourceBufferReady = false; }
+                catch (e) { console.error('appendBuffer:', e); }
+            }
+        } catch (e) { console.error('MediaSource setup:', e); }
+    }, { once: true });
+
+    callAudioEl.play().catch(e => console.warn('Audio autoplay blocked:', e));
+}
+
+async function handleAudioFrame(frame) {
+    if (!callKey) return;
+
+    try {
+        const encrypted = Crypto.base64ToArrayBuffer(frame.data);
+        const nonce     = new Uint8Array(Crypto.base64ToArrayBuffer(frame.nonce));
+        const decrypted = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: nonce }, callKey, encrypted
+        );
+
+        // Initialise playback on first init frame
+        if (frame.is_init && !audioMediaSource) {
+            initAudioPlayback(frame.mime || callAudioMimeType || 'audio/webm;codecs=opus');
+        }
+
+        if (!audioSourceBuffer) {
+            pendingAudioBuffers.push(decrypted);
+            return;
+        }
+
+        if (audioSourceBufferReady && !audioSourceBuffer.updating) {
+            try {
+                audioSourceBuffer.appendBuffer(decrypted);
+                audioSourceBufferReady = false;
+            } catch {
+                pendingAudioBuffers.push(decrypted);
+            }
+        } else {
+            pendingAudioBuffers.push(decrypted);
+        }
+    } catch (e) {
+        console.error('Audio decrypt error:', e);
+    }
+}
+
+function stopAudio() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch {}
+    }
+    mediaRecorder = null;
+
+    if (audioStream) {
+        audioStream.getTracks().forEach(t => t.stop());
+        audioStream = null;
+    }
+
+    if (audioMediaSource && audioMediaSource.readyState === 'open') {
+        try { audioMediaSource.endOfStream(); } catch {}
+    }
+    audioMediaSource        = null;
+    audioSourceBuffer       = null;
+    audioSourceBufferReady  = false;
+    pendingAudioBuffers     = [];
+
+    callAudioEl.pause();
+    callAudioEl.removeAttribute('src');
+}
+
+// ── Hang up / cleanup ─────────────────────────────────────────
+function endCall() {
+    if (callSocket && callSocket.readyState === WebSocket.OPEN) {
+        try { callSocket.send(JSON.stringify({ type: 'end' })); } catch {}
+    }
+    cleanupCall();
+}
+
+function cleanupCall() {
+    stopCallTimer();
+    stopCallHeartbeat();
+    stopAudio();
+
+    if (callSocket) { try { callSocket.close(); } catch {} callSocket = null; }
+
+    callState       = 'idle';
+    callId          = null;
+    callKey         = null;
+    callPeer        = null;
+    callIsInitiator = false;
+    audioSeq        = 0;
+    isFirstAudioChunk = true;
+
+    hideCallPill();
+}
+
+function closeCallWebSocket() {
+    stopCallHeartbeat();
+    if (callSocket) { try { callSocket.close(); } catch {} callSocket = null; }
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────
+function startCallHeartbeat() {
+    stopCallHeartbeat();
+    callHeartbeatTimer = setInterval(() => {
+        if (callSocket && callSocket.readyState === WebSocket.OPEN) {
+            callSocket.send(JSON.stringify({ type: 'ping' }));
+        }
+    }, 25000);
+}
+
+function stopCallHeartbeat() {
+    if (callHeartbeatTimer) { clearInterval(callHeartbeatTimer); callHeartbeatTimer = null; }
 }

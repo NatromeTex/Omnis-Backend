@@ -1,3 +1,4 @@
+import enum
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column,
@@ -222,9 +223,15 @@ class Message(Base):
         nullable=True,
     )
 
-    epoch_id = Column(Integer, ForeignKey("chat_epochs.id"))
-    ciphertext = Column(Text, nullable=False)
-    nonce = Column(String(48), nullable=False)
+    message_type = Column(String(8), nullable=False, default="text", server_default="text")
+    # call message fields (null for regular text messages)
+    call_uuid        = Column(String(36), nullable=True)
+    call_status      = Column(String(16), nullable=True)
+    duration_seconds = Column(Integer,    nullable=True)
+
+    epoch_id   = Column(Integer, ForeignKey("chat_epochs.id"))
+    ciphertext = Column(Text,        nullable=False, server_default="")
+    nonce      = Column(String(48),  nullable=False, server_default="")
 
     is_deleted = Column(Boolean, nullable=False, default=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -234,6 +241,36 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_chat_created", "chat_id", "created_at"),
         Index("ix_messages_reply_id", "reply_id"),
+    )
+
+
+class CallStatus(str, enum.Enum):
+    initiated = "initiated"   # caller sent initiate, callee not yet ringing
+    ringing   = "ringing"     # callee's WS connected, offer delivered
+    accepted  = "accepted"    # callee answered
+    ended     = "ended"       # either party ended cleanly
+    rejected  = "rejected"    # callee declined
+    missed    = "missed"      # 30s timeout with no answer
+
+
+class CallRecord(Base):
+    __tablename__ = "call_records"
+
+    id           = Column(Integer, primary_key=True)
+    call_uuid    = Column(String(36), nullable=False, unique=True)   # UUID v4 — used as WS path key
+    chat_id      = Column(Integer, ForeignKey("chats.id",  ondelete="CASCADE"), nullable=False)
+    initiator_id = Column(Integer, ForeignKey("users.id",  ondelete="CASCADE"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id",  ondelete="CASCADE"), nullable=False)
+    status       = Column(String(16), nullable=False, default="initiated")
+    created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    answered_at  = Column(DateTime, nullable=True)
+    ended_at     = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_call_records_chat",      "chat_id"),
+        Index("ix_call_records_initiator", "initiator_id"),
+        Index("ix_call_records_recipient", "recipient_id"),
+        Index("ix_call_records_uuid",      "call_uuid"),
     )
 
 

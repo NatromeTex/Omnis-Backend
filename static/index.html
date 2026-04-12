@@ -96,10 +96,15 @@
                                 <div id="chat-peer-avatar" class="peer-avatar">?</div>
                                 <h3 id="chat-with-user">Chat</h3>
                             </div>
+                            <button id="call-btn" class="btn icon-btn call-btn" title="Voice call" aria-label="Start voice call">
+                                <i class="fa-solid fa-phone"></i>
+                            </button>
                             <span id="encryption-badge" class="encryption-badge" title="End-to-End Encrypted">
                                 <i class="fa-solid fa-lock"></i> E2EE
                             </span>
                         </div>
+                        <div id="call-pill" class="call-pill hidden" role="region" aria-live="polite"></div>
+                        <audio id="call-audio" autoplay playsinline style="display:none"></audio>
                         <div id="messages-container" class="messages-container"></div>
                         <div id="reply-bar" class="reply-bar hidden">
                             <div class="reply-meta">

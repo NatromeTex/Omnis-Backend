@@ -55,3 +55,28 @@ class DeviceFcmTokenResponse(BaseModel):
     enabled: bool
     failure_count: int
     invalid_since: Optional[str] = None
+
+
+class CallInitiateResponse(BaseModel):
+    call_id: str
+    chat_id: int
+    initiator_id: int
+    recipient_id: int
+    status: str
+    created_at: str
+
+
+class CallHistoryEntry(BaseModel):
+    call_id: str
+    initiator_id: int
+    recipient_id: int
+    status: str
+    created_at: str
+    answered_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    duration_seconds: Optional[int] = None
+
+
+class CallHistoryResponse(BaseModel):
+    calls: list[CallHistoryEntry]
+    next_cursor: Optional[str] = None

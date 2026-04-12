@@ -19,11 +19,11 @@ from argon2 import PasswordHasher
 from models import Session as SessionModel
 from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta, timezone
-from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest, RegisterFcmTokenRequest, DeviceFcmTokenResponse
+from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest, RegisterFcmTokenRequest, DeviceFcmTokenResponse, CallInitiateResponse, CallHistoryResponse
 import secrets
 import rjsmin
 
-from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR, DevicePushToken
+from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR, DevicePushToken, CallRecord, CallStatus
 
 MAX_CHUNK_SIZE = 256 * 1024 * 1024  # 256 MiB
 FCM_PLATFORM_ANDROID = "android"
@@ -109,6 +109,102 @@ class ConnectionManager:
         return set(chat_conns.get(user_id, {}).keys())
 
 manager = ConnectionManager()
+
+
+def _as_utc(dt) -> datetime | None:
+    """Ensure a datetime is timezone-aware (UTC). SQLite returns naive datetimes."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+class CallManager:
+    """Tracks active WebSocket connections for in-progress calls.
+    Structure: call_uuid -> user_id -> WebSocket (at most 2 users per call).
+    """
+
+    def __init__(self):
+        self.active: dict[str, dict[int, WebSocket]] = {}
+        self._timeouts: dict[str, asyncio.TimerHandle] = {}
+        self._disconnect_tasks: dict[str, dict[int, asyncio.Task]] = {}
+
+    async def connect(self, call_uuid: str, user_id: int, ws: WebSocket) -> None:
+        self.active.setdefault(call_uuid, {})[user_id] = ws
+
+    def disconnect(self, call_uuid: str, user_id: int) -> None:
+        call_conns = self.active.get(call_uuid)
+        if call_conns:
+            call_conns.pop(user_id, None)
+            if not call_conns:
+                del self.active[call_uuid]
+
+    async def send_to(self, call_uuid: str, user_id: int, payload: dict) -> bool:
+        """Send to one specific participant. Returns False if not connected."""
+        ws = self.active.get(call_uuid, {}).get(user_id)
+        if not ws:
+            return False
+        try:
+            await ws.send_text(json.dumps(payload))
+            return True
+        except Exception:
+            self.disconnect(call_uuid, user_id)
+            return False
+
+    async def broadcast(self, call_uuid: str, payload: dict,
+                        exclude_user_id: int | None = None) -> None:
+        """Relay a message to all participants of a call."""
+        conns = self.active.get(call_uuid, {})
+        data = json.dumps(payload)
+        stale: list[int] = []
+        for uid, ws in conns.items():
+            if uid == exclude_user_id:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                stale.append(uid)
+        for uid in stale:
+            self.disconnect(call_uuid, uid)
+
+    def is_participant_connected(self, call_uuid: str, user_id: int) -> bool:
+        return user_id in self.active.get(call_uuid, {})
+
+    def schedule_missed_timeout(self, call_uuid: str, callback, delay: float = 30.0) -> None:
+        """Schedule a missed-call callback after `delay` seconds."""
+        loop = asyncio.get_event_loop()
+        handle = loop.call_later(delay, callback)
+        self._timeouts[call_uuid] = handle
+
+    def cancel_timeout(self, call_uuid: str) -> None:
+        handle = self._timeouts.pop(call_uuid, None)
+        if handle:
+            handle.cancel()
+
+    def schedule_disconnect_finalize(
+        self, call_uuid: str, user_id: int, coro
+    ) -> None:
+        """Start a grace-period task that finalizes the call unless the user reconnects."""
+        task = asyncio.ensure_future(coro)
+        self._disconnect_tasks.setdefault(call_uuid, {})[user_id] = task
+
+    def cancel_disconnect_task(self, call_uuid: str, user_id: int) -> bool:
+        """Cancel a pending disconnect finalization. Returns True if one was cancelled."""
+        tasks = self._disconnect_tasks.get(call_uuid, {})
+        task = tasks.pop(user_id, None)
+        if not tasks:
+            self._disconnect_tasks.pop(call_uuid, None)
+        if task:
+            task.cancel()
+            return True
+        return False
+
+    def has_disconnect_task(self, call_uuid: str, user_id: int) -> bool:
+        return user_id in self._disconnect_tasks.get(call_uuid, {})
+
+
+call_manager = CallManager()
 
 
 class FcmNotifier:
@@ -251,6 +347,57 @@ class FcmNotifier:
 
         return await asyncio.to_thread(_send_all)
 
+    async def send_call_event(
+        self,
+        fcm_tokens: list[str],
+        event_type: str,
+        call_uuid: str,
+        chat_id: int,
+        caller_id: int,
+    ) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {"ok": set(), "failed": set(), "invalid": set()}
+        if not self.enabled or self.messaging is None:
+            return result
+
+        data_payload = {
+            "event": event_type,
+            "call_id": call_uuid,
+            "chat_id": str(chat_id),
+            "caller_id": str(caller_id),
+        }
+
+        def _send_all() -> dict[str, set[str]]:
+            local: dict[str, set[str]] = {"ok": set(), "failed": set(), "invalid": set()}
+            for token in fcm_tokens:
+                msg = self.messaging.Message(
+                    token=token,
+                    data=data_payload,
+                    android=self.messaging.AndroidConfig(priority="high"),
+                )
+                try:
+                    self.messaging.send(msg)
+                    local["ok"].add(token)
+                    logger.info(
+                        "FCM call event sent (event=%s call_id=%s token=%s)",
+                        event_type, call_uuid, self._mask_token(token),
+                    )
+                except Exception as exc:
+                    if self._is_invalid_token_error(exc):
+                        local["invalid"].add(token)
+                        logger.warning(
+                            "FCM call event invalid token (event=%s call_id=%s token=%s error=%s)",
+                            event_type, call_uuid, self._mask_token(token), exc,
+                        )
+                    else:
+                        local["failed"].add(token)
+                        logger.error(
+                            "FCM call event send failed (event=%s call_id=%s token=%s error=%s)",
+                            event_type, call_uuid, self._mask_token(token), exc,
+                        )
+            return local
+
+        return await asyncio.to_thread(_send_all)
+
 
 fcm_notifier = FcmNotifier()
 
@@ -337,6 +484,200 @@ async def notify_chat_wake(
     finally:
         db.close()
 
+async def notify_call_event(
+    call_uuid: str,
+    chat_id: int,
+    recipient_user_id: int,
+    caller_id: int,
+    event_type: str,
+    exclude_device_ids: set[str] | None = None,
+) -> None:
+    """Send a call FCM push to recipient's eligible devices.
+
+    Mirrors notify_chat_wake. Pass exclude_device_ids to skip devices that
+    were already notified via the chat WebSocket broadcast.
+    """
+    if not fcm_notifier.enabled:
+        return
+
+    db: Session = SessionLocal()
+    try:
+        q = (
+            db.query(DevicePushToken)
+            .filter(
+                DevicePushToken.user_id == recipient_user_id,
+                DevicePushToken.platform == FCM_PLATFORM_ANDROID,
+                DevicePushToken.enabled == True,
+            )
+        )
+        if exclude_device_ids:
+            q = q.filter(~DevicePushToken.device_id.in_(exclude_device_ids))
+
+        token_rows = q.all()
+        if not token_rows:
+            return
+
+        push_result = await fcm_notifier.send_call_event(
+            fcm_tokens=[r.fcm_token for r in token_rows],
+            event_type=event_type,
+            call_uuid=call_uuid,
+            chat_id=chat_id,
+            caller_id=caller_id,
+        )
+
+        now = datetime.now(timezone.utc)
+        for row in token_rows:
+            if row.fcm_token in push_result["invalid"]:
+                row.enabled = False
+                row.invalid_since = now
+                row.failure_count += 1
+                row.last_error = "invalid-token"
+            elif row.fcm_token in push_result["failed"]:
+                row.failure_count += 1
+                row.last_error = "send-failed"
+            elif row.fcm_token in push_result["ok"]:
+                row.last_success_at = now
+                row.last_error = None
+                row.failure_count = 0
+
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _finalize_call(db: Session, call: CallRecord, status: CallStatus) -> Message:
+    """Write a terminal call status to DB and insert a call system message.
+
+    Returns the inserted Message so callers can broadcast it to the chat WS.
+    """
+    call.status = status
+    call.ended_at = datetime.now(timezone.utc)
+    db.flush()  # set ended_at before computing duration
+
+    duration: int | None = None
+    if call.answered_at and call.ended_at:
+        duration = int((_as_utc(call.ended_at) - _as_utc(call.answered_at)).total_seconds())
+
+    call_msg = Message(
+        chat_id=call.chat_id,
+        sender_id=call.initiator_id,
+        message_type="call",
+        call_uuid=call.call_uuid,
+        call_status=status,
+        duration_seconds=duration,
+        epoch_id=None,
+        ciphertext="",
+        nonce="",
+    )
+    db.add(call_msg)
+    db.commit()
+    db.refresh(call_msg)
+    return call_msg
+
+
+def _call_chat_ws_payload(call_msg: Message) -> dict:
+    """Build the new_message WS payload for a call system message."""
+    return {
+        "type": "new_message",
+        "message": {
+            "id": call_msg.id,
+            "sender_id": call_msg.sender_id,
+            "message_type": call_msg.message_type,
+            "call_uuid": call_msg.call_uuid,
+            "call_status": call_msg.call_status,
+            "duration_seconds": call_msg.duration_seconds,
+            "epoch_id": None,
+            "reply_id": None,
+            "ciphertext": None,
+            "nonce": None,
+            "deleted": False,
+            "created_at": call_msg.created_at.isoformat(),
+            "attachments": [],
+        },
+    }
+
+
+async def _handle_missed_call(
+    call_uuid: str,
+    chat_id: int,
+    initiator_id: int,
+    recipient_id: int,
+) -> None:
+    """Fires after the missed-call timeout — marks call missed if still pre-accepted."""
+    db: Session = SessionLocal()
+    try:
+        call = (
+            db.query(CallRecord)
+            .filter(CallRecord.call_uuid == call_uuid)
+            .one_or_none()
+        )
+        if not call or call.status not in (CallStatus.initiated, CallStatus.ringing):
+            return
+        call_msg = _finalize_call(db, call, CallStatus.missed)
+        await call_manager.broadcast(call_uuid, {
+            "type": "call_state",
+            "status": CallStatus.missed,
+            "call_id": call_uuid,
+        })
+        await manager.broadcast(chat_id, _call_chat_ws_payload(call_msg))
+        await notify_call_event(
+            call_uuid=call_uuid,
+            chat_id=chat_id,
+            recipient_user_id=recipient_id,
+            caller_id=initiator_id,
+            event_type="call_missed",
+        )
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def _disconnect_finalize_after_delay(
+    call_uuid: str,
+    user_id: int,
+    other_id: int,
+    delay: float = 10.0,
+) -> None:
+    """Grace-period task: finalize the call if the disconnected user doesn't reconnect."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return  # User reconnected — task was cancelled
+
+    db: Session = SessionLocal()
+    try:
+        call = (
+            db.query(CallRecord)
+            .filter(CallRecord.call_uuid == call_uuid)
+            .one_or_none()
+        )
+        if not call or call.status in (CallStatus.ended, CallStatus.rejected, CallStatus.missed):
+            return
+        call_msg = _finalize_call(db, call, CallStatus.ended)
+        call_manager.cancel_timeout(call_uuid)
+        await call_manager.broadcast(call_uuid, {"type": "ended", "call_id": call_uuid})
+        await manager.broadcast(call.chat_id, _call_chat_ws_payload(call_msg))
+        await notify_call_event(
+            call_uuid=call_uuid,
+            chat_id=call.chat_id,
+            recipient_user_id=other_id,
+            caller_id=user_id,
+            event_type="call_ended",
+        )
+    except Exception:
+        db.rollback()
+    finally:
+        # Remove task reference
+        tasks = call_manager._disconnect_tasks.get(call_uuid, {})
+        tasks.pop(user_id, None)
+        if not tasks:
+            call_manager._disconnect_tasks.pop(call_uuid, None)
+        db.close()
+
+
 # ── Startup ───────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -344,6 +685,7 @@ def startup():
     init_db()
     fcm_notifier.initialize()
     _minify_js()
+
 
 def _minify_js():
     src = os.path.join("static", "app.js")
@@ -1290,10 +1632,14 @@ async def chat_ws(
             {
                 "id": m.id,
                 "sender_id": m.sender_id,
+                "message_type": m.message_type,
+                "call_uuid": m.call_uuid,
+                "call_status": m.call_status,
+                "duration_seconds": m.duration_seconds,
                 "epoch_id": m.epoch_id,
                 "reply_id": m.reply_id,
-                "ciphertext": "" if m.is_deleted else m.ciphertext,
-                "nonce": "" if m.is_deleted else m.nonce,
+                "ciphertext": "" if (m.is_deleted or m.message_type == "call") else m.ciphertext,
+                "nonce": "" if (m.is_deleted or m.message_type == "call") else m.nonce,
                 "deleted": m.is_deleted,
                 "created_at": m.created_at.isoformat(),
                 "attachments": _attachments_for_message(m.id, db),
@@ -1349,6 +1695,249 @@ async def chat_ws(
                 for conns in manager.active.values()
             ):
                 _ws_msg_times.pop(user.id, None)
+        db.close()
+
+
+# ── Call WebSocket ────────────────────────────────────────────────────
+
+# Per-call rate-limiting: (call_uuid + str(user_id)) -> deque of timestamps
+_call_msg_times: dict[str, deque] = {}
+
+@app.websocket("/call/ws/{call_uuid}")
+async def call_ws(
+    websocket: WebSocket,
+    call_uuid: str,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    db: Session = SessionLocal()
+    user = None
+    call = None
+    rl_key = ""
+    try:
+        # 1. Validate device_id format
+        if not is_valid_uuid4(device_id):
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        # 2. Authenticate (reuses ws_authenticate, same as chat_ws)
+        user = ws_authenticate(token, device_id, db)
+        token = None  # discard plaintext token
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        # 3. Validate call_uuid format
+        if not is_valid_uuid4(call_uuid):
+            await websocket.close(code=4004, reason="Call not found")
+            return
+
+        # 4. Load call record and verify this user is a participant
+        call = (
+            db.query(CallRecord)
+            .filter(CallRecord.call_uuid == call_uuid)
+            .one_or_none()
+        )
+        if not call:
+            await websocket.close(code=4004, reason="Call not found")
+            return
+
+        if user.id not in (call.initiator_id, call.recipient_id):
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        # 5. Reject if call is already in a terminal state
+        if call.status in (CallStatus.ended, CallStatus.rejected, CallStatus.missed):
+            await websocket.close(code=4010, reason="Call already ended")
+            return
+
+        # 6. Reject duplicate connection (one WS per user per call).
+        # Exception: allow reconnection if a disconnect grace-period task is pending.
+        reconnecting = call_manager.cancel_disconnect_task(call_uuid, user.id)
+        if not reconnecting and call_manager.is_participant_connected(call_uuid, user.id):
+            await websocket.close(code=4001, reason="Already connected")
+            return
+
+        # 7. Accept connection
+        await websocket.accept()
+        await call_manager.connect(call_uuid, user.id, websocket)
+
+        # 8. Transition: initiated -> ringing when callee connects
+        if user.id == call.recipient_id and call.status == CallStatus.initiated:
+            call.status = CallStatus.ringing
+            db.commit()
+            asyncio.ensure_future(call_manager.broadcast(call_uuid, {
+                "type": "call_state",
+                "status": CallStatus.ringing,
+                "call_id": call_uuid,
+            }))
+
+        # 9. Main receive loop
+        rl_key = call_uuid + str(user.id)  # rate-limit key for this session
+        while True:
+            try:
+                data = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+
+            # Frame size guard: 4096 bytes covers Opus at 64 kbps with generous headroom
+            if len(data) > 4096:
+                await websocket.close(code=1009, reason="Message too large")
+                break
+
+            # Rate limit: 100 msg/s per user per call (50 pps audio + signaling)
+            now_ts = datetime.now(timezone.utc)
+            times = _call_msg_times.setdefault(rl_key, deque())
+            while times and (now_ts - times[0]).total_seconds() > 1.0:
+                times.popleft()
+            if len(times) >= 100:
+                await websocket.close(code=4029, reason="Rate limit exceeded")
+                break
+            times.append(now_ts)
+
+            try:
+                msg = json.loads(data)
+            except Exception:
+                continue
+
+            msg_type = msg.get("type")
+
+            # Reload call state from DB before each state-machine check
+            db.refresh(call)
+
+            if msg_type == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+
+            elif msg_type == "offer":
+                # Only the initiator may send an offer
+                if user.id != call.initiator_id:
+                    await websocket.send_text(json.dumps({
+                        "type": "error", "detail": "Only initiator sends offer",
+                    }))
+                    continue
+                if call.status not in (CallStatus.initiated, CallStatus.ringing):
+                    continue
+                # Relay offer to callee — caller_id sourced from DB to prevent spoofing
+                await call_manager.send_to(call_uuid, call.recipient_id, {
+                    "type": "offer",
+                    "sdp": msg.get("sdp", ""),
+                    "wrapped_call_key": msg.get("wrapped_call_key", ""),
+                    "caller_id": call.initiator_id,
+                })
+
+            elif msg_type == "answer":
+                if user.id != call.recipient_id:
+                    continue
+                if call.status != CallStatus.ringing:
+                    continue
+                call.status = CallStatus.accepted
+                call.answered_at = datetime.now(timezone.utc)
+                db.commit()
+                call_manager.cancel_timeout(call_uuid)
+                await call_manager.send_to(call_uuid, call.initiator_id, {
+                    "type": "answer",
+                    "sdp": msg.get("sdp", ""),
+                })
+                asyncio.ensure_future(call_manager.broadcast(call_uuid, {
+                    "type": "call_state",
+                    "status": CallStatus.accepted,
+                    "call_id": call_uuid,
+                }))
+
+            elif msg_type == "ice_candidate":
+                other_id = (
+                    call.recipient_id if user.id == call.initiator_id
+                    else call.initiator_id
+                )
+                await call_manager.send_to(call_uuid, other_id, {
+                    "type": "ice_candidate",
+                    "candidate": msg.get("candidate", ""),
+                    "sdp_mid": msg.get("sdp_mid", ""),
+                    "sdp_mline_index": msg.get("sdp_mline_index", 0),
+                    "from_user_id": user.id,
+                })
+
+            elif msg_type == "audio_frame":
+                # Only relay when the call is active; server never inspects `data`
+                if call.status != CallStatus.accepted:
+                    continue
+                other_id = (
+                    call.recipient_id if user.id == call.initiator_id
+                    else call.initiator_id
+                )
+                relay: dict = {
+                    "type": "audio_frame",
+                    "data": msg.get("data", ""),
+                    "seq": msg.get("seq", 0),
+                    "nonce": msg.get("nonce", ""),
+                }
+                if msg.get("is_init"):
+                    relay["is_init"] = True
+                    relay["mime"] = msg.get("mime", "")
+                await call_manager.send_to(call_uuid, other_id, relay)
+
+            elif msg_type == "reject":
+                if user.id != call.recipient_id:
+                    continue
+                if call.status not in (CallStatus.initiated, CallStatus.ringing):
+                    continue
+                call_msg = _finalize_call(db, call, CallStatus.rejected)
+                call_manager.cancel_timeout(call_uuid)
+                asyncio.ensure_future(call_manager.broadcast(call_uuid, {
+                    "type": "rejected",
+                    "call_id": call_uuid,
+                }))
+                asyncio.ensure_future(manager.broadcast(call.chat_id, _call_chat_ws_payload(call_msg)))
+                asyncio.ensure_future(notify_call_event(
+                    call_uuid=call_uuid,
+                    chat_id=call.chat_id,
+                    recipient_user_id=call.initiator_id,
+                    caller_id=call.recipient_id,
+                    event_type="call_ended",
+                ))
+                break
+
+            elif msg_type == "end":
+                if call.status in (CallStatus.ended, CallStatus.rejected, CallStatus.missed):
+                    break
+                other_id = (
+                    call.recipient_id if user.id == call.initiator_id
+                    else call.initiator_id
+                )
+                call_msg = _finalize_call(db, call, CallStatus.ended)
+                call_manager.cancel_timeout(call_uuid)
+                asyncio.ensure_future(call_manager.broadcast(call_uuid, {
+                    "type": "ended",
+                    "call_id": call_uuid,
+                }))
+                asyncio.ensure_future(manager.broadcast(call.chat_id, _call_chat_ws_payload(call_msg)))
+                asyncio.ensure_future(notify_call_event(
+                    call_uuid=call_uuid,
+                    chat_id=call.chat_id,
+                    recipient_user_id=other_id,
+                    caller_id=user.id,
+                    event_type="call_ended",
+                ))
+                break
+
+    finally:
+        if user is not None and call is not None:
+            call_manager.disconnect(call_uuid, user.id)
+            db.refresh(call)
+            if call.status not in (CallStatus.ended, CallStatus.rejected, CallStatus.missed):
+                other_id = (
+                    call.recipient_id if user.id == call.initiator_id
+                    else call.initiator_id
+                )
+                # 10-second grace period: finalize only if the user doesn't reconnect
+                call_manager.schedule_disconnect_finalize(
+                    call_uuid, user.id,
+                    _disconnect_finalize_after_delay(call_uuid, user.id, other_id, 10.0),
+                )
+        # Clean up rate-limit state
+        _call_msg_times.pop(rl_key, None)
         db.close()
 
 
@@ -1430,10 +2019,14 @@ async def fetch_chat(
         {
             "id": m.id,
             "sender_id": m.sender_id,
+            "message_type": m.message_type,
+            "call_uuid": m.call_uuid,
+            "call_status": m.call_status,
+            "duration_seconds": m.duration_seconds,
             "epoch_id": m.epoch_id,
             "reply_id": m.reply_id,
-            "ciphertext": "" if m.is_deleted else m.ciphertext,
-            "nonce": "" if m.is_deleted else m.nonce,
+            "ciphertext": "" if (m.is_deleted or m.message_type == "call") else m.ciphertext,
+            "nonce": "" if (m.is_deleted or m.message_type == "call") else m.nonce,
             "deleted": m.is_deleted,
             "created_at": m.created_at,
             "attachments": _attachments_for_message(m.id, db),
@@ -1768,6 +2361,10 @@ async def message(
         "message": {
             "id": msg.id,
             "sender_id": msg.sender_id,
+            "message_type": msg.message_type,
+            "call_uuid": msg.call_uuid,
+            "call_status": msg.call_status,
+            "duration_seconds": msg.duration_seconds,
             "epoch_id": msg.epoch_id,
             "reply_id": msg.reply_id,
             "ciphertext": msg.ciphertext,
@@ -1846,3 +2443,147 @@ async def delete_message(
     }))
 
     return {"status": "deleted", "message_id": message_id}
+
+
+# ── Call REST endpoints ────────────────────────────────────────────────
+
+@app.post("/call/{chat_id}/initiate", status_code=201, response_model=CallInitiateResponse)
+async def initiate_call(
+    chat_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    # 1. Verify caller is a member of this chat
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == chat_id,
+            or_(Chat.user_a_id == user.id, Chat.user_b_id == user.id),
+        )
+        .one_or_none()
+    )
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    recipient_id = chat.user_b_id if chat.user_a_id == user.id else chat.user_a_id
+
+    # 2. Reject if there is already an active call in this chat
+    existing = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.chat_id == chat_id,
+            CallRecord.status.in_([
+                CallStatus.initiated,
+                CallStatus.ringing,
+                CallStatus.accepted,
+            ]),
+        )
+        .one_or_none()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="A call is already active in this chat")
+
+    # 3. Create the call record
+    call_uuid = str(uuid.uuid4())
+    call = CallRecord(
+        call_uuid=call_uuid,
+        chat_id=chat_id,
+        initiator_id=user.id,
+        recipient_id=recipient_id,
+        status=CallStatus.initiated,
+    )
+    db.add(call)
+    db.commit()
+    db.refresh(call)
+
+    # 4. Schedule missed-call timeout (30 seconds)
+    call_manager.schedule_missed_timeout(
+        call_uuid=call_uuid,
+        callback=lambda: asyncio.ensure_future(
+            _handle_missed_call(call_uuid, chat_id, user.id, recipient_id)
+        ),
+        delay=30.0,
+    )
+
+    # 5a. Notify callee devices connected to the chat WebSocket right now
+    ws_payload = {
+        "type": "call_incoming",
+        "call_id": call_uuid,
+        "chat_id": chat_id,
+        "caller_id": user.id,
+    }
+    asyncio.ensure_future(manager.broadcast(chat_id, ws_payload, exclude_user_id=user.id))
+
+    # 5b. Notify callee devices NOT already reached via WebSocket via FCM
+    already_notified = manager.active_device_ids(chat_id, recipient_id)
+    asyncio.ensure_future(notify_call_event(
+        call_uuid=call_uuid,
+        chat_id=chat_id,
+        recipient_user_id=recipient_id,
+        caller_id=user.id,
+        event_type="call_incoming",
+        exclude_device_ids=already_notified,
+    ))
+
+    return {
+        "call_id": call_uuid,
+        "chat_id": chat_id,
+        "initiator_id": user.id,
+        "recipient_id": recipient_id,
+        "status": call.status,
+        "created_at": call.created_at.isoformat(),
+    }
+
+
+@app.get("/call/{chat_id}/history", response_model=CallHistoryResponse)
+async def call_history(
+    chat_id: int,
+    before: str | None = Query(None),
+    limit: int = Query(20, le=50),
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    # Verify chat membership
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == chat_id,
+            or_(Chat.user_a_id == user.id, Chat.user_b_id == user.id),
+        )
+        .one_or_none()
+    )
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    q = db.query(CallRecord).filter(CallRecord.chat_id == chat_id)
+    if before:
+        try:
+            before_dt = datetime.fromisoformat(before)
+            q = q.filter(CallRecord.created_at < before_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+
+    calls = q.order_by(desc(CallRecord.created_at)).limit(limit).all()
+
+    def _duration(c: CallRecord) -> int | None:
+        if c.answered_at and c.ended_at:
+            return int((_as_utc(c.ended_at) - _as_utc(c.answered_at)).total_seconds())
+        return None
+
+    entries = [
+        {
+            "call_id": c.call_uuid,
+            "initiator_id": c.initiator_id,
+            "recipient_id": c.recipient_id,
+            "status": c.status,
+            "created_at": c.created_at.isoformat(),
+            "answered_at": c.answered_at.isoformat() if c.answered_at else None,
+            "ended_at": c.ended_at.isoformat() if c.ended_at else None,
+            "duration_seconds": _duration(c),
+        }
+        for c in calls
+    ]
+
+    next_cursor = calls[-1].created_at.isoformat() if calls else None
+
+    return {"calls": entries, "next_cursor": next_cursor}
