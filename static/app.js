@@ -2426,6 +2426,8 @@ let callIsInitiator = false;
 let callTimerInterval  = null;
 let callSeconds        = 0;
 let callHeartbeatTimer = null;
+let lastPingTime       = 0;    // performance.now() of the last outgoing ping
+let callRtt            = null; // last measured RTT in ms
 
 // Audio capture
 let audioStream       = null;   // local MediaStream from getUserMedia
@@ -2481,6 +2483,7 @@ function showCallPill(state, peerName) {
             <div class="call-pill-info">
                 <span class="call-pill-icon" style="color:#4caf50"><i class="fa-solid fa-phone"></i></span>
                 <span class="call-pill-text" id="call-timer-display">0:00</span>
+                <span class="call-rtt" id="call-rtt-display" aria-label="Round-trip time"></span>
             </div>
             <div class="call-pill-actions">
                 <button class="end-btn" title="End call" aria-label="End call" onclick="endCall()">
@@ -2574,6 +2577,14 @@ async function initiateCall() {
     if (!currentChatId || !currentChatPeer || callState !== 'idle') return;
 
     try {
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+        console.error('Microphone denied:', e);
+        alert('Microphone access is required to start a call.');
+        return;
+    }
+
+    try {
         const resp = await fetch(`${API_BASE}/call/${currentChatId}/initiate`, {
             method: 'POST',
             headers: {
@@ -2585,6 +2596,8 @@ async function initiateCall() {
         if (!resp.ok) {
             if (resp.status === 409) { alert('A call is already active in this chat.'); }
             else { console.error('Failed to initiate call:', resp.status); }
+            audioStream.getTracks().forEach(t => t.stop());
+            audioStream = null;
             return;
         }
 
@@ -2598,6 +2611,7 @@ async function initiateCall() {
         setupCallWebSocket(callId, true);
     } catch (e) {
         console.error('initiateCall error:', e);
+        if (audioStream) { audioStream.getTracks().forEach(t => t.stop()); audioStream = null; }
     }
 }
 
@@ -2714,8 +2728,21 @@ async function handleCallWsMessage(data, isInitiator) {
             break;
 
         case 'pong':
+            if (lastPingTime > 0) {
+                callRtt = Math.round(performance.now() - lastPingTime);
+                lastPingTime = 0;
+                updateRttDisplay();
+            }
             break;
     }
+}
+
+function updateRttDisplay() {
+    const el = document.getElementById('call-rtt-display');
+    if (!el || callRtt === null) return;
+    const color = callRtt < 100 ? '#4caf50' : callRtt < 250 ? '#f4a43a' : '#e53935';
+    el.textContent = `· ${callRtt} ms`;
+    el.style.color = color;
 }
 
 // ── Offer / answer key exchange ────────────────────────────────
@@ -2740,16 +2767,6 @@ async function sendCallOffer() {
             sdp: '',
             wrapped_call_key: wrappedKey,
         }));
-
-        // Request mic permission for the caller now that we have a confirmed callee
-        if (!audioStream) {
-            try {
-                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            } catch (e) {
-                alert('Microphone access is required for calls.');
-                endCall();
-            }
-        }
     } catch (e) {
         console.error('sendCallOffer error:', e);
         endCall();
@@ -2971,6 +2988,8 @@ function cleanupCall() {
     callIsInitiator = false;
     audioSeq        = 0;
     isFirstAudioChunk = true;
+    lastPingTime    = 0;
+    callRtt         = null;
 
     hideCallPill();
 }
@@ -2985,9 +3004,10 @@ function startCallHeartbeat() {
     stopCallHeartbeat();
     callHeartbeatTimer = setInterval(() => {
         if (callSocket && callSocket.readyState === WebSocket.OPEN) {
+            lastPingTime = performance.now();
             callSocket.send(JSON.stringify({ type: 'ping' }));
         }
-    }, 25000);
+    }, 3000);
 }
 
 function stopCallHeartbeat() {

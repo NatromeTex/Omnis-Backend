@@ -662,6 +662,20 @@ If the timeout elapses with no message the connection is also closed with
 }
 ```
 
+*call_incoming* (pushed to the callee's chat WebSocket when a call is initiated)
+```json
+{
+  "type": "call_incoming",
+  "call_id": "uuid-v4",
+  "chat_id": 42,
+  "caller_id": 1
+}
+```
+
+The client should surface an incoming-call UI on receiving this frame. Connecting
+to the call WebSocket (`/call/ws/{call_id}`) signals acceptance; sending a `reject`
+message over that socket signals decline.
+
 *pong*
 ```json
 {
@@ -1097,6 +1111,258 @@ Errors:
 - `401` — unauthorized
 - `404` — media not found or user is not a member of the chat
 - `404` — file not found on disk
+
+---
+
+## Voice Call Endpoints
+
+### POST /call/{chat_id}/initiate
+
+Creates a new call record and notifies the callee. The caller must acquire
+microphone permission **before** calling this endpoint. If the request succeeds,
+the caller opens the call WebSocket immediately.
+
+**Auth:** required
+
+**Path parameters**
+- `chat_id` — integer
+
+**Response — 201 Created**
+```json
+{
+  "call_id": "uuid-v4",
+  "chat_id": 42,
+  "initiator_id": 1,
+  "recipient_id": 2,
+  "status": "initiated",
+  "created_at": "ISO-8601"
+}
+```
+
+The server simultaneously:
+- Pushes a `call_incoming` frame to callee devices connected to `/chat/ws/{chat_id}`.
+- Sends an FCM wake push to callee devices not reachable via WebSocket.
+- Starts a **30-second missed-call timer**. If the callee does not answer within
+  30 seconds, the call is marked `missed` and both parties are notified.
+
+Errors:
+- `401` — unauthorized
+- `404` — chat not found or user is not a member
+- `409` — a call is already active in this chat
+
+---
+
+### WebSocket /call/ws/{call_uuid}
+
+Dedicated signaling and audio-relay WebSocket for an in-progress call.
+Both caller and callee connect to this endpoint.
+
+**Connection URL**
+```
+ws://<host>:8000/call/ws/{call_uuid}?token=<session_token>&device_id=<uuid-v4>
+```
+
+Authentication is via **query parameters** (token and device_id). This differs
+from the chat WebSocket, which authenticates via a first frame. The call WebSocket
+accepts the connection only after verifying the credentials and call membership.
+
+**Path parameters**
+- `call_uuid` — UUID v4 string identifying the call
+
+**Query parameters**
+- `token` — session token returned by `POST /auth/login`
+- `device_id` — client UUID v4 device identifier
+
+**Constraints**
+- Maximum frame size: **4096 bytes**. Frames larger than this close the connection with code `1009`.
+- Rate limit: **100 frames/second** per user per call. Exceeding this closes with code `4029`.
+- Only one WebSocket connection per user per call is permitted at a time.
+  An existing connection is replaced if the client reconnects within the
+  **10-second disconnect grace period** (see below).
+
+**Call state machine**
+
+```
+initiated ──(callee WS connect)──► ringing ──(callee sends answer)──► accepted
+    │                                  │
+    ├──(30s timeout)──► missed          ├──(callee sends reject)──► rejected
+    │                                  │
+    └──(either side sends end / disconnects after grace period)──► ended
+```
+
+State transitions are broadcast to all call participants via `call_state` frames.
+
+**Disconnect grace period**
+
+When a participant's WebSocket closes unexpectedly (network drop, app background,
+etc.), the server waits **10 seconds** before finalizing the call as `ended`. If
+the participant reconnects within that window, the call resumes. After 10 seconds
+with no reconnection the call is ended and both parties receive an `ended` frame.
+
+**Server → Client frames**
+
+*call_state* — broadcast when call status changes
+```json
+{
+  "type": "call_state",
+  "status": "ringing",
+  "call_id": "uuid-v4"
+}
+```
+Possible `status` values: `ringing`, `accepted`, `missed`, `rejected`, `ended`.
+
+*offer* — relayed from caller to callee; contains the wrapped call session key
+```json
+{
+  "type": "offer",
+  "sdp": "",
+  "wrapped_call_key": "<base64>",
+  "caller_id": 1
+}
+```
+
+*answer* — relayed from callee to caller
+```json
+{
+  "type": "answer",
+  "sdp": ""
+}
+```
+
+*audio_frame* — relayed between participants; payload is opaque to the server
+```json
+{
+  "type": "audio_frame",
+  "data": "<base64 AES-GCM ciphertext>",
+  "seq": 42,
+  "nonce": "<base64 12-byte nonce>",
+  "is_init": true,
+  "mime": "audio/webm;codecs=opus"
+}
+```
+`is_init` and `mime` are present **only on the first audio frame** sent by each
+side and are used by the receiver to initialise its audio playback pipeline.
+
+*rejected* — broadcast when callee rejects
+```json
+{ "type": "rejected", "call_id": "uuid-v4" }
+```
+
+*ended* — broadcast when either party ends the call
+```json
+{ "type": "ended", "call_id": "uuid-v4" }
+```
+
+*pong*
+```json
+{ "type": "pong" }
+```
+
+**Client → Server frames**
+
+*ping* — keepalive / RTT probe
+```json
+{ "type": "ping" }
+```
+Clients should send a ping every **3 seconds** during an active call. The elapsed
+time between sending ping and receiving pong is the round-trip time to the server.
+
+*offer* — sent by the caller after receiving `call_state: ringing`
+```json
+{
+  "type": "offer",
+  "sdp": "",
+  "wrapped_call_key": "<base64>"
+}
+```
+`wrapped_call_key` is the per-call AES-256 session key wrapped for the callee
+using the same ECDH + HKDF + AES-GCM mechanism as epoch keys. See
+[frontend.md](frontend.md) section 3.7 for the full key-exchange protocol.
+
+*answer* — sent by the callee after unwrapping the call key
+```json
+{ "type": "answer", "sdp": "" }
+```
+Sending `answer` transitions the call to `accepted` and starts the server's
+`answered_at` timestamp (used for duration calculation).
+
+*audio_frame* — encrypted audio data (only relayed when call status is `accepted`)
+```json
+{
+  "type": "audio_frame",
+  "data": "<base64 AES-GCM ciphertext>",
+  "seq": 42,
+  "nonce": "<base64 12-byte nonce>",
+  "is_init": true,
+  "mime": "audio/webm;codecs=opus"
+}
+```
+The first audio frame sent by each participant **must** include `is_init: true`
+and the `mime` field. Subsequent frames omit both fields. The `seq` counter is
+per-sender and starts at 0.
+
+*reject* — sent by the callee to decline the call (must be in `initiated` or `ringing` state)
+```json
+{ "type": "reject" }
+```
+
+*end* — sent by either party to end the call
+```json
+{ "type": "end" }
+```
+
+**Close codes**
+| Code | Meaning |
+|------|---------|
+| 1009 | Message too large (> 4096 bytes) |
+| 4001 | Unauthorized (bad token, device_id, or not a call participant) |
+| 4004 | Call not found |
+| 4010 | Call already in a terminal state |
+| 4029 | Rate limit exceeded (> 100 frames/second) |
+
+---
+
+### GET /call/{chat_id}/history
+
+Returns past call records for a chat in reverse chronological order.
+
+**Auth:** required
+
+**Path parameters**
+- `chat_id` — integer
+
+**Query parameters**
+```
+before: ISO-8601 timestamp (optional)  # return calls older than this timestamp
+limit:  integer (optional, default 20, max 50)
+```
+
+**Response — 200 OK**
+```json
+{
+  "calls": [
+    {
+      "call_id": "uuid-v4",
+      "initiator_id": 1,
+      "recipient_id": 2,
+      "status": "ended",
+      "created_at": "ISO-8601",
+      "answered_at": "ISO-8601 or null",
+      "ended_at": "ISO-8601 or null",
+      "duration_seconds": 142
+    }
+  ],
+  "next_cursor": "ISO-8601 or null"
+}
+```
+
+- `status` is one of: `initiated`, `ringing`, `accepted`, `ended`, `rejected`, `missed`.
+- `duration_seconds` is the number of whole seconds between `answered_at` and `ended_at`, or `null` if the call was never answered.
+- `next_cursor` is the `created_at` of the oldest record returned. Pass it as `before` to page backwards.
+
+Errors:
+- `401` — unauthorized
+- `404` — chat not found or user is not a member
 
 ---
 

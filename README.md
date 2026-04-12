@@ -9,6 +9,7 @@ For the complete REST API contract, see [endpoints.md](endpoints.md). For client
 - Session-based authentication with per-device sessions.
 - Stores encrypted identity key material and exposes public identity keys.
 - Manages one-to-one chats, epochs, and message metadata.
+- End-to-end encrypted voice calls relayed over WebSocket with a custom audio frame protocol.
 - Persists data via SQLAlchemy models.
 
 ## Tech stack
@@ -27,6 +28,14 @@ For the complete REST API contract, see [endpoints.md](endpoints.md). For client
 - Android FCM push is used only as a wake signal when recipient devices are not actively connected to that chat WebSocket.
 - Push payloads include wake metadata and generic text only; clients fetch encrypted message data after wake.
 - The backend never includes ciphertext, epoch keys, or private key material in FCM payloads.
+
+## Voice Call Model
+- Calls are initiated via `POST /call/{chat_id}/initiate` and signaled over a dedicated call WebSocket (`/call/ws/{call_uuid}`).
+- Audio is encrypted end-to-end on the client (AES-256-GCM with a per-call session key) and relayed opaquely by the server — the server never sees plaintext audio.
+- The call session key is derived using the same ECDH + HKDF + AES-GCM wrapping mechanism as epoch keys.
+- Each call transitions through a server-tracked state machine (`initiated → ringing → accepted → ended/rejected/missed`).
+- A 30-second server-side timeout marks unanswered calls as `missed`.
+- A 10-second client-disconnect grace period is applied before a call is finalized, allowing brief network interruptions to recover without ending the call.
 
 ## Files of interest
 - Application entrypoint: [main.py](main.py)

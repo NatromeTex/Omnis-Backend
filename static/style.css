@@ -1375,6 +1375,14 @@ input:focus {
     text-overflow: ellipsis;
 }
 
+.call-rtt {
+    font-size: 0.7rem;
+    opacity: 0.8;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: color 0.4s;
+}
+
 .call-pill-actions {
     display: flex;
     gap: 0.35rem;

@@ -12,6 +12,7 @@ The frontend is a thin client responsible for:
   - Signup, login, logout
   - Listing chats and creating new chats
   - Sending and receiving messages in real time (WebSocket-first, REST fallback)
+  - Initiating, accepting, and ending end-to-end encrypted voice calls
   - Account/session management UI (view/revoke sessions)
 - **Local cryptography** (end‑to‑end encryption)
   - Generating and managing long‑term identity key pairs (ECDH P‑384)
@@ -19,10 +20,12 @@ The frontend is a thin client responsible for:
   - Generating per‑chat epoch keys (AES‑GCM 256‑bit)
   - Wrapping/unwrapping epoch keys for each peer (ECDH + HKDF + AES‑GCM)
   - Encrypting and decrypting message payloads using epoch keys (AES‑GCM)
+  - Generating per-call AES-256-GCM session keys and encrypting audio frames
 - **Networking**
   - Talking to the backend over HTTPS (REST) and WSS/WS (chat stream)
   - Including device identifier (`X-Device-ID`) and bearer token for authenticated calls
   - Authenticating chat WebSocket connections with a first-frame auth payload
+  - Authenticating call WebSocket connections via query parameters
   - Registering and managing device push tokens for background wake delivery (mobile)
 
 The server **never sees plaintext messages or identity private keys**. It only stores encrypted key material and ciphertext.
@@ -300,6 +303,226 @@ as an offline wake mechanism.
 - Push is a wake hint, not a transport for protected message content.
 - Full message confidentiality remains end-to-end via client-side key handling.
 - Device scoping remains enforced by `(Bearer token, X-Device-ID)` pairing.
+
+---
+
+### 3.7 Voice Call Handling
+
+Omnis supports end-to-end encrypted, server-relayed voice calls. The server
+relays encrypted audio frames opaquely and never decrypts audio data. All audio
+encryption and decryption happen exclusively on the client.
+
+---
+
+#### Call state machine
+
+```
+idle ──(user initiates)──► outgoing ──(callee connects)──► [offer sent]
+                                                                  │
+                                          ┌───────────────────────┘
+                                          ▼
+idle ──(call_incoming WS frame)──► incoming ──(user accepts)──► connecting
+                                                                     │
+                                          ┌──────────────────────────┘
+                                          ▼
+                                       active ──(either party ends)──► idle
+```
+
+Client-side states: `idle`, `outgoing`, `incoming`, `connecting`, `active`.
+
+Server-side statuses: `initiated`, `ringing`, `accepted`, `ended`, `rejected`, `missed`.
+
+---
+
+#### Microphone permission
+
+Microphone access **must** be requested and granted **before** any call is
+initiated or accepted. Clients must not call `POST /call/{chat_id}/initiate`
+or connect to the call WebSocket until the user has granted microphone
+permission. If the user denies permission, the call flow must abort and the
+server must not be contacted.
+
+This ensures:
+- The user is informed of microphone access before any network action is taken.
+- If permission is denied mid-flow after a call is already created on the server
+  (e.g. due to an OS prompt timing issue), the client must release any acquired
+  audio tracks and call the `end` WebSocket message to terminate the server-side
+  call record.
+
+---
+
+#### Caller flow
+
+1. User taps the call button.
+2. Client requests microphone permission (`getUserMedia({ audio: true })`).
+   - If denied: display an error. **Do not proceed.**
+3. Client calls `POST /call/{chat_id}/initiate`.
+   - If the server returns `409`: inform the user a call is already active.
+   - On any error: release the microphone track and abort.
+4. Client stores the returned `call_id` and opens the call WebSocket:
+   ```
+   ws://<host>/call/ws/{call_id}?token=<token>&device_id=<device_id>
+   ```
+5. Client waits for a `call_state: ringing` frame (callee has connected).
+6. On `ringing`, client generates a fresh per-call AES-256-GCM session key
+   (`callKey`), wraps it for the callee, and sends an `offer` frame:
+   ```json
+   {
+     "type": "offer",
+     "sdp": "",
+     "wrapped_call_key": "<base64>"
+   }
+   ```
+7. Client waits for an `answer` frame from the server (relayed from callee).
+8. On `answer`, client transitions to `active` and starts audio capture.
+
+---
+
+#### Callee flow
+
+1. Client receives a `call_incoming` frame on the chat WebSocket:
+   ```json
+   { "type": "call_incoming", "call_id": "uuid", "chat_id": 42, "caller_id": 1 }
+   ```
+2. Client displays an incoming-call UI.
+3. **To accept**: request microphone permission. If denied, abort.
+4. On permission granted, open the call WebSocket (same URL scheme as caller).
+5. Wait for an `offer` frame from the server.
+6. Unwrap `wrapped_call_key` using the call key exchange (see below) to obtain
+   `callKey`.
+7. Send `answer`:
+   ```json
+   { "type": "answer", "sdp": "" }
+   ```
+8. Transition to `active` and start audio capture.
+9. **To reject**: open the call WebSocket briefly, send `reject`, close.
+
+---
+
+#### Call session key exchange
+
+The per-call symmetric key (`callKey`) is a freshly generated AES-256-GCM key.
+It is wrapped using the **identical mechanism** as epoch keys:
+
+1. Caller generates `callKey` randomly.
+2. Caller derives ECDH shared secret between `caller_priv` and `callee_pub`.
+3. Caller applies HKDF-SHA-256 (salt: 32 zero bytes; info: `"epoch-key-wrap"`;
+   output: 32 bytes) to the shared secret to obtain a wrapping key.
+4. Caller encrypts `callKey` under the wrapping key using AES-GCM (12-byte nonce).
+5. Serialised as `nonce || ciphertext`, base64-encoded → `wrapped_call_key`.
+
+Callee reverses the process using `callee_priv` and `caller_pub`. Because
+ECDH(A_priv, B_pub) == ECDH(B_priv, A_pub), the wrapping key is identical on
+both sides.
+
+The caller's public key is available from `GET /user/pkey/get?username=<caller>`.
+
+---
+
+#### Audio capture and encoding
+
+- Capture: use the platform's audio capture API (browser: `MediaRecorder`; native:
+  platform audio recorder) with the following parameters:
+  - Codec: **Opus** preferred. Supported container formats in order of preference:
+    `audio/webm;codecs=opus`, `audio/webm`, `audio/ogg;codecs=opus`, `audio/ogg`.
+    Use whichever is supported by both the encoder and the receiver's decoder.
+  - Bitrate: **64 kbps**.
+  - Chunk interval: **100 ms** (producing ~800-byte raw frames at 64 kbps).
+- Encryption: for each captured chunk:
+  1. Generate a fresh 12-byte random nonce.
+  2. Encrypt the raw audio bytes with AES-256-GCM using `callKey` and the nonce.
+  3. Base64-encode the ciphertext and nonce.
+- Frame format:
+  ```json
+  {
+    "type": "audio_frame",
+    "data": "<base64 AES-GCM ciphertext>",
+    "seq": 0,
+    "nonce": "<base64 12-byte nonce>"
+  }
+  ```
+  The **first audio frame** from each side **must** additionally include:
+  ```json
+  {
+    "is_init": true,
+    "mime": "audio/webm;codecs=opus"
+  }
+  ```
+  `mime` must match the container format used by the encoder. The receiver uses
+  this to initialise its audio playback pipeline. Subsequent frames omit both
+  fields.
+- Maximum serialised frame size: **4096 bytes** (server enforced). If a frame
+  exceeds this limit, drop it and retain `is_init = true` so the next attempt
+  still carries the init metadata.
+- `seq` is a per-sender monotonically increasing integer starting at 0.
+
+---
+
+#### Audio playback
+
+1. Wait for the first audio frame with `is_init: true` from the remote side.
+2. Initialise a streaming audio decoder / media source using `frame.mime`.
+   - Browser: initialise a `MediaSource` and add a `SourceBuffer` with `frame.mime`.
+   - Native: initialise the platform's media decoder for the given MIME type.
+3. For each received frame:
+   a. Decrypt: `AES-GCM.decrypt(callKey, base64_decode(frame.data), nonce=base64_decode(frame.nonce))`.
+   b. Feed the raw decrypted bytes to the audio decoder in arrival order.
+4. If the `is_init` frame is missed or arrives late, do not attempt playback
+   until it arrives. Buffer all subsequent frames in arrival order and prepend
+   the init segment when it becomes available.
+
+---
+
+#### WebSocket heartbeat and RTT
+
+- Send a `ping` frame every **3 seconds** while the call WebSocket is open.
+- Record the send timestamp immediately before each `ping`.
+- On receiving `pong`, compute RTT = `receive_timestamp − send_timestamp`.
+- Display RTT to the user as a call-quality indicator (suggested thresholds:
+  green < 100 ms, amber < 250 ms, red ≥ 250 ms).
+- The heartbeat also keeps the WebSocket alive through NAT/proxy idle timeouts.
+
+---
+
+#### Disconnect grace period
+
+The server applies a **10-second grace period** when a call participant's
+WebSocket closes unexpectedly. During this window:
+
+- The call record is not finalized.
+- If the participant reconnects, the call resumes as if no disconnection occurred.
+- After 10 seconds with no reconnection, the server ends the call and broadcasts
+  an `ended` frame to the remaining participant.
+
+Clients should attempt to reconnect the call WebSocket immediately on an
+unexpected close (e.g. brief network drop) rather than treating it as a hard
+hang-up.
+
+---
+
+#### Call system messages
+
+When a call reaches a terminal state (`ended`, `rejected`, `missed`), the server
+inserts a `message_type = 'call'` row into `messages` and broadcasts it via the
+chat WebSocket as a `new_message` frame. The message object will contain:
+
+```json
+{
+  "id": 1234,
+  "message_type": "call",
+  "call_status": "ended",
+  "duration_seconds": 142,
+  "created_at": "ISO-8601",
+  "sender_id": 1,
+  "ciphertext": "",
+  "nonce": "",
+  "attachments": []
+}
+```
+
+Clients **must** check `message_type` before attempting decryption. Call messages
+have empty `ciphertext` and `nonce`; do not attempt decryption. Render them as
+call-event cards using `call_status` and `duration_seconds`.
 
 ---
 
